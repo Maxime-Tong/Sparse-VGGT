@@ -11,7 +11,6 @@ import logging
 import os
 import warnings
 
-import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -48,50 +47,9 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def _sparse_scaled_dot_product(self, q: Tensor, k: Tensor, v: Tensor, sparse_mask: Tensor) -> Tensor:
-        B, H, N, D = q.shape
-        _, S, _ = sparse_mask.shape
-        P = N // S
-        
-        # TODO: support batch_size != 1
-        assert B == 1
-        
-        q_frame = q.view(B, H, S, P, D)  # (B, H, S, P, D)
-        k_frame = k.view(B, H, S, P, D)  # (B, H, S, P, D)
-        v_frame = v.view(B, H, S, P, D)  # (B, H, S, P, D)
-
-        # 2. 初始化输出：(B, H, S, P, D)
-        x_out = torch.zeros_like(q_frame)
-
-        for s in range(S): 
-            q_s = q_frame[:, :, s] * self.scale  # (B, H, P, D)
-
-            valid_t = sparse_mask[:, s].nonzero(as_tuple=True)[1]  # (B, T)
-            T = valid_t.shape[0]  # 有效帧数（固定为K+1）
-
-            k_t = k_frame[:, :, valid_t]  # (B, H, T, P, D)
-            v_t = v_frame[:, :, valid_t]  # (B, H, T, P, D)
-
-            k_t = k_t.reshape(B, H, T * P, D)
-            v_t = v_t.reshape(B, H, T * P, D)
-
-            # q_s (B, H, P, D)；k_t (B, H, T * P, D)
-            sim = (q_s @ k_t.transpose(-2, -1)) # (B, H, P, T * P)
-
-            attn_weight = sim.softmax(dim=-1)
-
-            # if self.training and self.attn_drop.p > 0:
-                # attn_weight = self.attn_drop(attn_weight)
-
-            # (B, H, P, D)
-            weighted_v = attn_weight @ v_t
-            x_out[:, :, s] = weighted_v
-
-        return x_out.view(B, H, N, D)
-
-    def forward(self, x: Tensor, pos=None, sparse_mask: Tensor = None) -> Tensor:
+    def forward(self, x: Tensor, pos=None) -> Tensor:
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) # [3, B, H, N, D]
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
@@ -99,9 +57,7 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        if sparse_mask is not None:
-            x = self._sparse_scaled_dot_product(q, k, v, sparse_mask)
-        elif self.fused_attn:
+        if self.fused_attn:
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
         else:
             q = q * self.scale
@@ -117,12 +73,12 @@ class Attention(nn.Module):
 
 
 class MemEffAttention(Attention):
-    def forward(self, x: Tensor, attn_bias=None, pos=None, sparse_mask=None) -> Tensor:
+    def forward(self, x: Tensor, attn_bias=None, pos=None) -> Tensor:
         assert pos is None
         if not XFORMERS_AVAILABLE:
             if attn_bias is not None:
                 raise AssertionError("xFormers is required for using nested tensors")
-            return super().forward(x, sparse_mask=sparse_mask)
+            return super().forward(x)
 
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)

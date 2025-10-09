@@ -1,5 +1,7 @@
 .hydra/
 output/
+.ipynb
+weights/
 ckpt/
 # Byte-compiled / optimized / DLL files
 __pycache__/

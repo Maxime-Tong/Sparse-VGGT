@@ -31,17 +31,13 @@ from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
 from vggt.dependency.track_predict import predict_tracks
 from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np_matrix_to_pycolmap_wo_track
 
-
-# TODO: add support for masks
-# TODO: add iterative BA
-# TODO: add support for radial distortion, which needs extra_params
-# TODO: test with more cases
-# TODO: test different camera types
-
+from utils.config_utils import load_config
+from utils.dataset import load_dataset
 
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Demo")
-    parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
+    parser.add_argument("--config", type=str, required=True, help="Directory containing the scene configs")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory for output")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--use_ba", action="store_true", default=False, help="Use BA for reconstruction")
     ######### BA parameters #########
@@ -111,17 +107,18 @@ def demo_fn(args):
 
     # Run VGGT for camera and depth estimation
     model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    _URL = "weights/model.pt"
+    model.load_state_dict(torch.load(_URL))
     model.eval()
     model = model.to(device)
     print(f"Model loaded")
 
     # Get image paths and preprocess them
-    image_dir = os.path.join(args.scene_dir, "images")
-    image_path_list = glob.glob(os.path.join(image_dir, "*"))
-    if len(image_path_list) == 0:
-        raise ValueError(f"No images found in {image_dir}")
+    # image_dir = os.path.join(args.scene_dir, "images")
+    config = load_config(args.config)
+    dataset = load_dataset(config, '', config)
+    image_dir = os.path.dirname(dataset.color_paths[0])
+    image_path_list = dataset.color_paths[:100]
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
     # Load images and original coordinates
@@ -240,13 +237,13 @@ def demo_fn(args):
         shared_camera=shared_camera,
     )
 
-    print(f"Saving reconstruction to {args.scene_dir}/sparse")
-    sparse_reconstruction_dir = os.path.join(args.scene_dir, "sparse")
+    print(f"Saving reconstruction to {args.output_dir}/sparse")
+    sparse_reconstruction_dir = os.path.join(args.output_dir, "sparse")
     os.makedirs(sparse_reconstruction_dir, exist_ok=True)
     reconstruction.write(sparse_reconstruction_dir)
 
     # Save point cloud for fast visualization
-    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.scene_dir, "sparse/points.ply"))
+    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.output_dir, "sparse/points.ply"))
 
     return True
 

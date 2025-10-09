@@ -1,0 +1,3 @@
+Dataset:
+  type: 'tum'
+  sensor_type: 'monocular'

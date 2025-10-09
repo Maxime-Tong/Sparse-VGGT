@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from torch import Tensor
 from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
@@ -180,6 +181,42 @@ class Aggregator(nn.Module):
             # Disable gradient updates for mask token
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
+                
+    def _generate_sparse_mask(self, patch_tokens: Tensor, B: int, S: int, P: int, K: int = 2) -> Tensor:
+        patch_tokens = patch_tokens.view(B, S, -1)  # (B, S, P * C)
+        frame_feat_norm = F.normalize(patch_tokens, dim=-1)
+        first_frame_feat = frame_feat_norm[:, :1]
+        sim_matrix = (frame_feat_norm @ first_frame_feat.transpose(-2, -1)).squeeze(-1)  # (B, S)
+        sorted_indices = torch.argsort(sim_matrix, dim=1)  # (B, S)
+        
+        rank_to_original = sorted_indices  # (B, S)
+        
+        offsets = torch.arange(-(K//2), K//2 + 1, device=patch_tokens.device)
+        num_offsets = offsets.shape[0]
+        
+        neighbor_ranks = torch.arange(S, device=patch_tokens.device).unsqueeze(0).unsqueeze(2) + offsets.unsqueeze(0).unsqueeze(1)
+        neighbor_ranks = torch.clamp(neighbor_ranks, 0, S-1)
+        
+        valid_frames_sorted = torch.gather(
+            rank_to_original.unsqueeze(2).expand(-1, -1, num_offsets),  # (B, S, num_offsets)
+            dim=1,
+            index=neighbor_ranks  # (B, S, num_offsets)
+        )
+        
+        original_to_rank = torch.zeros_like(sorted_indices)
+        original_to_rank.scatter_(1, sorted_indices, torch.arange(S, device=patch_tokens.device).unsqueeze(0))
+        
+        r_indices = original_to_rank.unsqueeze(2).expand(-1, -1, num_offsets)
+        valid_frames = torch.gather(valid_frames_sorted, dim=1, index=r_indices)  # (B, S, num_offsets)
+        
+        first_frame = torch.zeros(B, S, 1, device=patch_tokens.device, dtype=torch.long)  # (B, S, 1)
+        valid_frames = torch.cat([first_frame, valid_frames], dim=2)  # (B, S, num_offsets+1)
+        
+        frame_mask = torch.zeros(B, S, S, device=patch_tokens.device, dtype=torch.bool)
+        b_idx = torch.arange(B).unsqueeze(1).unsqueeze(2).expand(-1, S, valid_frames.shape[2])  # (B, S, T)
+        s_idx = torch.arange(S).unsqueeze(0).unsqueeze(2).expand(B, -1, valid_frames.shape[2])  # (B, S, T)
+        frame_mask[b_idx, s_idx, valid_frames] = True
+        return frame_mask
 
     def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
         """
@@ -203,11 +240,17 @@ class Aggregator(nn.Module):
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
         patch_tokens = self.patch_embed(images)
+        
+        # Save patch_tokens
+        # torch.save(patch_tokens, 'output/tmp/patch_tokens.pt')
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         _, P, C = patch_tokens.shape
+        sparse_mask = None
+        if not self.training:
+            sparse_mask = self._generate_sparse_mask(patch_tokens=patch_tokens, B=B, S=S, P=P)
 
         # Expand camera and register tokens to match batch size and sequence length
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
@@ -229,7 +272,6 @@ class Aggregator(nn.Module):
 
         # update P because we added special tokens
         _, P, C = tokens.shape
-
         frame_idx = 0
         global_idx = 0
         output_list = []
@@ -242,7 +284,7 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, sparse_mask=sparse_mask
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -281,7 +323,7 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, sparse_mask=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -298,7 +340,7 @@ class Aggregator(nn.Module):
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, sparse_mask=sparse_mask)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
