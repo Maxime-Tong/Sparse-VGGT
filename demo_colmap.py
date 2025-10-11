@@ -118,7 +118,7 @@ def demo_fn(args):
     config = load_config(args.config)
     dataset = load_dataset(config, '', config)
     image_dir = os.path.dirname(dataset.color_paths[0])
-    image_path_list = dataset.color_paths[:100]
+    image_path_list = dataset.color_paths[:20]
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
     # Load images and original coordinates

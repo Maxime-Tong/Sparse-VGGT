@@ -107,6 +107,7 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    layer=_
                 )
                 for _ in range(depth)
             ]
@@ -182,41 +183,65 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
                 
-    def _generate_sparse_mask(self, patch_tokens: Tensor, B: int, S: int, P: int, K: int = 2) -> Tensor:
-        patch_tokens = patch_tokens.view(B, S, -1)  # (B, S, P * C)
-        frame_feat_norm = F.normalize(patch_tokens, dim=-1)
-        first_frame_feat = frame_feat_norm[:, :1]
-        sim_matrix = (frame_feat_norm @ first_frame_feat.transpose(-2, -1)).squeeze(-1)  # (B, S)
-        sorted_indices = torch.argsort(sim_matrix, dim=1)  # (B, S)
+    def _cluster_frames(self, tokens: torch.Tensor, n_clusters: int = 5, pca_dim: int = 64):
+        """
+        Cluster frame-level features to find representative keyframes.
+
+        Args:
+            tokens (torch.Tensor): shape (B*S, P, C), frame-wise tokens.
+            n_clusters (int): number of clusters.
+            pca_dim (int): PCA dimension reduction before K-means.
+
+        Returns:
+            dict with:
+                'clusters': list[torch.Tensor], indices of frames per cluster.
+                'keyframes': torch.Tensor, indices of keyframes (closest to cluster centers).
+        """
+        from sklearn.decomposition import PCA
+        from sklearn.cluster import KMeans
         
-        rank_to_original = sorted_indices  # (B, S)
-        
-        offsets = torch.arange(-(K//2), K//2 + 1, device=patch_tokens.device)
-        num_offsets = offsets.shape[0]
-        
-        neighbor_ranks = torch.arange(S, device=patch_tokens.device).unsqueeze(0).unsqueeze(2) + offsets.unsqueeze(0).unsqueeze(1)
-        neighbor_ranks = torch.clamp(neighbor_ranks, 0, S-1)
-        
-        valid_frames_sorted = torch.gather(
-            rank_to_original.unsqueeze(2).expand(-1, -1, num_offsets),  # (B, S, num_offsets)
-            dim=1,
-            index=neighbor_ranks  # (B, S, num_offsets)
-        )
-        
-        original_to_rank = torch.zeros_like(sorted_indices)
-        original_to_rank.scatter_(1, sorted_indices, torch.arange(S, device=patch_tokens.device).unsqueeze(0))
-        
-        r_indices = original_to_rank.unsqueeze(2).expand(-1, -1, num_offsets)
-        valid_frames = torch.gather(valid_frames_sorted, dim=1, index=r_indices)  # (B, S, num_offsets)
-        
-        first_frame = torch.zeros(B, S, 1, device=patch_tokens.device, dtype=torch.long)  # (B, S, 1)
-        valid_frames = torch.cat([first_frame, valid_frames], dim=2)  # (B, S, num_offsets+1)
-        
-        frame_mask = torch.zeros(B, S, S, device=patch_tokens.device, dtype=torch.bool)
-        b_idx = torch.arange(B).unsqueeze(1).unsqueeze(2).expand(-1, S, valid_frames.shape[2])  # (B, S, T)
-        s_idx = torch.arange(S).unsqueeze(0).unsqueeze(2).expand(B, -1, valid_frames.shape[2])  # (B, S, T)
-        frame_mask[b_idx, s_idx, valid_frames] = True
-        return frame_mask
+        assert tokens.dim() == 3, "tokens should have shape (B*S, P, C)"
+        num_frames = tokens.shape[0]
+        device = tokens.device
+
+        # ---- Step 1. flatten each frame ----
+        X = tokens.reshape(num_frames, -1).cpu().numpy()  # shape: (B*S, P*C)
+
+        # ---- Step 2. optional PCA reduction ----
+        if X.shape[1] > pca_dim:
+            pca = PCA(n_components=10, random_state=42)
+            X_reduced = pca.fit_transform(X)
+        else:
+            X_reduced = X
+
+        # ---- Step 3. run K-means ----
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+        labels = kmeans.fit_predict(X_reduced)
+        centers = kmeans.cluster_centers_
+
+        # ---- Step 4. find keyframes (closest to each cluster center) ----
+        keyframes = []
+        for i in range(n_clusters):
+            cluster_indices = torch.where(torch.tensor(labels) == i)[0]
+            cluster_feats = X_reduced[cluster_indices]
+            center = centers[i]
+
+            # compute Euclidean distance to center
+            dists = ((cluster_feats - center) ** 2).sum(axis=1)
+            closest_idx = cluster_indices[dists.argmin()]
+            keyframes.append(closest_idx.item())
+
+        # ---- Step 5. organize results ----
+        clusters = []
+        for i in range(n_clusters):
+            clusters.append(torch.where(torch.tensor(labels, device=device) == i)[0])
+
+        result = {
+            "num_frames": num_frames,
+            "clusters": clusters,
+            "keyframes": torch.tensor(keyframes, dtype=torch.long, device=device)
+        }
+        return result
 
     def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
         """
@@ -248,9 +273,9 @@ class Aggregator(nn.Module):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         _, P, C = patch_tokens.shape
-        sparse_mask = None
+        hierarchy_data = None
         if not self.training:
-            sparse_mask = self._generate_sparse_mask(patch_tokens=patch_tokens, B=B, S=S, P=P)
+            hierarchy_data = self._cluster_frames(patch_tokens)
 
         # Expand camera and register tokens to match batch size and sequence length
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
@@ -284,7 +309,7 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos, sparse_mask=sparse_mask
+                        tokens, B, S, P, C, global_idx, pos=pos, hierarchy_data=hierarchy_data
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -323,7 +348,7 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, sparse_mask=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, hierarchy_data=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -340,7 +365,7 @@ class Aggregator(nn.Module):
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos, sparse_mask=sparse_mask)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, hierarchy_data=hierarchy_data)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

@@ -16,6 +16,8 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
 
+from typing import Dict
+
 XFORMERS_AVAILABLE = False
 
 
@@ -32,6 +34,7 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        layer=0
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -47,49 +50,67 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
+        self.layer = layer
 
-    def _sparse_scaled_dot_product(self, q: Tensor, k: Tensor, v: Tensor, sparse_mask: Tensor) -> Tensor:
+    def _hierarchy_dot_product(self, q: Tensor, k: Tensor, v: Tensor, hierarchy_data: Dict, topk_ratio: float = 0.1) -> Tensor:
         B, H, N, D = q.shape
-        _, S, _ = sparse_mask.shape
-        P = N // S
+        device = q.device
         
-        # TODO: support batch_size != 1
-        assert B == 1
+        S = hierarchy_data["num_frames"]
+        keyframes = hierarchy_data["keyframes"]
+        clusters = hierarchy_data["clusters"]
+        K = len(clusters)
+        tokens_per_frame = N // S
         
-        q_frame = q.view(B, H, S, P, D)  # (B, H, S, P, D)
-        k_frame = k.view(B, H, S, P, D)  # (B, H, S, P, D)
-        v_frame = v.view(B, H, S, P, D)  # (B, H, S, P, D)
+        # ---- Step 1. Coarse-level attention among keyframes ----
+        # Select all query tokens belonging to keyframes
+        key_q_indices = []
+        for f_idx in keyframes:
+            start = f_idx * tokens_per_frame
+            end = (f_idx + 1) * tokens_per_frame
+            key_q_indices.append(torch.arange(start, end, device=device))
+        key_q_indices = torch.cat(key_q_indices, dim=0)  # [K * P_k]
 
-        # 2. 初始化输出：(B, H, S, P, D)
-        x_out = torch.zeros_like(q_frame)
+        q_proto = q[:, :, key_q_indices, :]  # (B, H, K*P_k, D)
+        k_proto = k[:, :, key_q_indices, :]
 
-        for s in range(S): 
-            q_s = q_frame[:, :, s] * self.scale  # (B, H, P, D)
+        # All keys are used at coarse level
+        attn_scores = torch.matmul(q_proto * self.scale, k.transpose(-2, -1))  # (B, H, K*P_k, K*P_k)
+        # attn_weights = F.softmax(attn_scores, dim=-1)
 
-            valid_t = sparse_mask[:, s].nonzero(as_tuple=True)[1]  # (B, T)
-            T = valid_t.shape[0]  # 有效帧数（固定为K+1）
+        # ---- Step 2. Select top-k keys for each keyframe ----
+        topk_tokens = []
+        topk_num = max(1, int(tokens_per_frame * K * topk_ratio))  # e.g. 10%
+        topk_vals, topk_idx = torch.topk(attn_scores, k=topk_num, dim=-1, sorted=False)
 
-            k_t = k_frame[:, :, valid_t]  # (B, H, T, P, D)
-            v_t = v_frame[:, :, valid_t]  # (B, H, T, P, D)
+        # ---- Step 3. Fine-level attention within each cluster ----
+        x_out = torch.zeros_like(q)
 
-            k_t = k_t.reshape(B, H, T * P, D)
-            v_t = v_t.reshape(B, H, T * P, D)
+        for cluster_idx, frame_indices in enumerate(clusters):
+            # Collect all q indices belonging to this cluster
+            q_indices = []
+            for f_idx in frame_indices:
+                start = f_idx * tokens_per_frame
+                end = (f_idx + 1) * tokens_per_frame
+                q_indices.append(torch.arange(start, end, device=device))
+            q_indices = torch.cat(q_indices, dim=0)
 
-            # q_s (B, H, P, D)；k_t (B, H, T * P, D)
-            sim = (q_s @ k_t.transpose(-2, -1)) # (B, H, P, T * P)
+            # The selected key tokens (topk) for the corresponding keyframe
+            cluster_key_idx = topk_tokens[cluster_idx]
+            q_cluster = q[:, :, q_indices, :]       # (B, H, Qc, D)
+            k_cluster = k[:, :, cluster_key_idx, :] # (B, H, Kc, D)
+            v_cluster = v[:, :, cluster_key_idx, :] # (B, H, Kc, D)
 
-            attn_weight = sim.softmax(dim=-1)
+            attn = torch.matmul(q_cluster * self.scale, k_cluster.transpose(-2, -1))
+            attn = F.softmax(attn, dim=-1)
+            x_cluster = torch.matmul(attn, v_cluster).type(q.dtype)
 
-            # if self.training and self.attn_drop.p > 0:
-                # attn_weight = self.attn_drop(attn_weight)
-
-            # (B, H, P, D)
-            weighted_v = attn_weight @ v_t
-            x_out[:, :, s] = weighted_v
+            # write back the results
+            x_out[:, :, q_indices, :] = x_cluster
 
         return x_out.view(B, H, N, D)
 
-    def forward(self, x: Tensor, pos=None, sparse_mask: Tensor = None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, hierarchy_data: Dict = None) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) # [3, B, H, N, D]
         q, k, v = qkv.unbind(0)
@@ -99,8 +120,8 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        if sparse_mask is not None:
-            x = self._sparse_scaled_dot_product(q, k, v, sparse_mask)
+        if hierarchy_data is not None:
+            x = self._hierarchy_dot_product(q, k, v, hierarchy_data)
         elif self.fused_attn:
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
         else:
@@ -117,12 +138,12 @@ class Attention(nn.Module):
 
 
 class MemEffAttention(Attention):
-    def forward(self, x: Tensor, attn_bias=None, pos=None, sparse_mask=None) -> Tensor:
+    def forward(self, x: Tensor, attn_bias=None, pos=None, hierarchy_data=None) -> Tensor:
         assert pos is None
         if not XFORMERS_AVAILABLE:
             if attn_bias is not None:
                 raise AssertionError("xFormers is required for using nested tensors")
-            return super().forward(x, sparse_mask=sparse_mask)
+            return super().forward(x, hierarchy_data=hierarchy_data)
 
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)

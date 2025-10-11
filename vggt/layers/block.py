@@ -44,6 +44,7 @@ class Block(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        layer=0
     ) -> None:
         super().__init__()
 
@@ -59,6 +60,7 @@ class Block(nn.Module):
             qk_norm=qk_norm,
             fused_attn=fused_attn,
             rope=rope,
+            layer=layer
         )
 
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -74,9 +76,9 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None, sparse_mask: Tensor = None) -> Tensor:
-        def attn_residual_func(x: Tensor, pos=None, sparse_mask=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos, sparse_mask=sparse_mask))
+    def forward(self, x: Tensor, pos=None, hierarchy_data: Dict = None) -> Tensor:
+        def attn_residual_func(x: Tensor, pos=None, hierarchy_data=None) -> Tensor:
+            return self.ls1(self.attn(self.norm1(x), pos=pos, hierarchy_data=hierarchy_data))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
@@ -93,7 +95,7 @@ class Block(nn.Module):
             x = x + self.drop_path1(attn_residual_func(x, pos=pos))
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x, pos=pos, sparse_mask=sparse_mask)
+            x = x + attn_residual_func(x, pos=pos, hierarchy_data=hierarchy_data)
             x = x + ffn_residual_func(x)
         return x
 
