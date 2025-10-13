@@ -51,64 +51,76 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
         self.layer = layer
-
-    def _hierarchy_dot_product(self, q: Tensor, k: Tensor, v: Tensor, hierarchy_data: Dict, topk_ratio: float = 0.1) -> Tensor:
-        B, H, N, D = q.shape
-        device = q.device
         
+        self.use_hierarchy = True
+
+    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.4) -> torch.Tensor:
+        """
+        Optimized Hierarchical Attention:
+        - Coarse: cluster-level mean over frames (patch preserved for fine)
+        - Fine: intra-cluster + neighbor clusters sparse attention
+        """
+
+        B, H, N, D = q.shape
         S = hierarchy_data["num_frames"]
-        keyframes = hierarchy_data["keyframes"]
         clusters = hierarchy_data["clusters"]
         K = len(clusters)
-        tokens_per_frame = N // S
+        P = N // S
+        device = q.device
+
+        # ---- Step 1. reshape ----
+        q = q.view(B, H, S, P, D)
+        k = k.view(B, H, S, P, D)
+        v = v.view(B, H, S, P, D)
+
+        # ---- Step 2. cluster-level prototypes (mean over frames, preserve patch dimension) ----
+        q_proto, k_proto = [], []
+        for c in clusters:
+            q_proto.append(q[:, :, c, :, :].mean(dim=2))  # (B,H,P,D)
+            k_proto.append(k[:, :, c, :, :].mean(dim=2))
+
+        # (B,H,K,P,D)
+        q_proto = torch.stack(q_proto, dim=2)
+        k_proto = torch.stack(k_proto, dim=2)
         
-        # ---- Step 1. Coarse-level attention among keyframes ----
-        # Select all query tokens belonging to keyframes
-        key_q_indices = []
-        for f_idx in keyframes:
-            start = f_idx * tokens_per_frame
-            end = (f_idx + 1) * tokens_per_frame
-            key_q_indices.append(torch.arange(start, end, device=device))
-        key_q_indices = torch.cat(key_q_indices, dim=0)  # [K * P_k]
+        # ---- Step 3. Coarse attention (frame-level mean only, no full patch flatten)
+        # reduce patch dimension before computing cluster-to-cluster similarity
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
+            q_mean = q_proto.mean(dim=3)  # (B,H,K,D)
+            k_mean = k_proto.mean(dim=3)  # (B,H,K,D)
+            attn_scores = torch.matmul(q_mean, k_mean.transpose(-2, -1)) * self.scale  # (B,H,K,K)
 
-        q_proto = q[:, :, key_q_indices, :]  # (B, H, K*P_k, D)
-        k_proto = k[:, :, key_q_indices, :]
+            # 平均head，找每个cluster最相关的topK
+            top_k = max(1, int(K * top_ratio))
+            _, top_idx = torch.topk(attn_scores.mean(dim=1), k=top_k, dim=-1)  # (B,K,top_k)
+            del q_mean, k_mean, attn_scores  
 
-        # All keys are used at coarse level
-        attn_scores = torch.matmul(q_proto * self.scale, k.transpose(-2, -1))  # (B, H, K*P_k, K*P_k)
-        # attn_weights = F.softmax(attn_scores, dim=-1)
+        # ---- Step 4. Fine attention ----
+        out_frames = torch.zeros(B, H, S, P, D, device=device, dtype=q.dtype)
 
-        # ---- Step 2. Select top-k keys for each keyframe ----
-        topk_tokens = []
-        topk_num = max(1, int(tokens_per_frame * K * topk_ratio))  # e.g. 10%
-        topk_vals, topk_idx = torch.topk(attn_scores, k=topk_num, dim=-1, sorted=False)
+        for ci, frame_ids in enumerate(clusters):
+            q_local = q[:, :, frame_ids, :, :].reshape(B, H, -1, D)
+            k_local = k[:, :, frame_ids, :, :].reshape(B, H, -1, D)
+            v_local = v[:, :, frame_ids, :, :].reshape(B, H, -1, D)
 
-        # ---- Step 3. Fine-level attention within each cluster ----
-        x_out = torch.zeros_like(q)
+            # 添加 coarse 阶段最相关 cluster（只添加一次，使用缓存）
+            neighbor_clusters = top_idx[0, ci].tolist()
+            for nc in neighbor_clusters:
+                if nc != ci: 
+                    k_local = torch.cat([k_local, k[:, :, clusters[nc], :, :].reshape(B, H, -1, D)], dim=2)
+                    v_local = torch.cat([v_local, v[:, :, clusters[nc], :, :].reshape(B, H, -1, D)], dim=2)
 
-        for cluster_idx, frame_indices in enumerate(clusters):
-            # Collect all q indices belonging to this cluster
-            q_indices = []
-            for f_idx in frame_indices:
-                start = f_idx * tokens_per_frame
-                end = (f_idx + 1) * tokens_per_frame
-                q_indices.append(torch.arange(start, end, device=device))
-            q_indices = torch.cat(q_indices, dim=0)
+            # 稀疏 attention (coarse 约束 + chunked)
+            out_local = F.scaled_dot_product_attention(q_local, k_local, v_local, dropout_p=0.0, is_causal=False).type(q.dtype)
 
-            # The selected key tokens (topk) for the corresponding keyframe
-            cluster_key_idx = topk_tokens[cluster_idx]
-            q_cluster = q[:, :, q_indices, :]       # (B, H, Qc, D)
-            k_cluster = k[:, :, cluster_key_idx, :] # (B, H, Kc, D)
-            v_cluster = v[:, :, cluster_key_idx, :] # (B, H, Kc, D)
+            out_frames[:, :, frame_ids, :, :] = out_local.view(B, H, len(frame_ids), P, D)
 
-            attn = torch.matmul(q_cluster * self.scale, k_cluster.transpose(-2, -1))
-            attn = F.softmax(attn, dim=-1)
-            x_cluster = torch.matmul(attn, v_cluster).type(q.dtype)
+            # 显式清理，防止 block 级内存占用累积
+            del q_local, k_local, v_local, out_local
+            torch.cuda.empty_cache()
 
-            # write back the results
-            x_out[:, :, q_indices, :] = x_cluster
+        return out_frames.view(B, H, N, D)
 
-        return x_out.view(B, H, N, D)
 
     def forward(self, x: Tensor, pos=None, hierarchy_data: Dict = None) -> Tensor:
         B, N, C = x.shape
@@ -120,7 +132,7 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        if hierarchy_data is not None:
+        if hierarchy_data is not None and self.use_hierarchy:
             x = self._hierarchy_dot_product(q, k, v, hierarchy_data)
         elif self.fused_attn:
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)

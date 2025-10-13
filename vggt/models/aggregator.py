@@ -183,7 +183,7 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
                 
-    def _cluster_frames(self, tokens: torch.Tensor, n_clusters: int = 5, pca_dim: int = 64):
+    def _cluster_frames(self, tokens: torch.Tensor, n_clusters: int = 10, pca_dim: int = 64):
         """
         Cluster frame-level features to find representative keyframes.
 
@@ -208,22 +208,20 @@ class Aggregator(nn.Module):
         X = tokens.reshape(num_frames, -1).cpu().numpy()  # shape: (B*S, P*C)
 
         # ---- Step 2. optional PCA reduction ----
-        if X.shape[1] > pca_dim:
-            pca = PCA(n_components=10, random_state=42)
-            X_reduced = pca.fit_transform(X)
-        else:
-            X_reduced = X
+        # if X.shape[1] > pca_dim:
+        #     pca = PCA(n_components=pca_dim, random_state=42)
+        #     X = pca.fit_transform(X)
 
         # ---- Step 3. run K-means ----
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-        labels = kmeans.fit_predict(X_reduced)
+        labels = kmeans.fit_predict(X)
         centers = kmeans.cluster_centers_
 
         # ---- Step 4. find keyframes (closest to each cluster center) ----
         keyframes = []
         for i in range(n_clusters):
             cluster_indices = torch.where(torch.tensor(labels) == i)[0]
-            cluster_feats = X_reduced[cluster_indices]
+            cluster_feats = X[cluster_indices]
             center = centers[i]
 
             # compute Euclidean distance to center
