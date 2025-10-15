@@ -34,11 +34,57 @@ from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np
 from utils.config_utils import load_config
 from utils.dataset import load_dataset
 
+class CudaTimer:
+    def __init__(self, name="Timer", enable=True, stream=None):
+        """
+        CUDA 计时器，用于测量 GPU 上代码段运行时间（毫秒）
+        Args:
+            name (str): 打印标识名称
+            enable (bool): 是否启用计时
+            stream (torch.cuda.Stream): 可选的 CUDA stream
+        """
+        self.name = name
+        self.enable = enable
+        self.stream = stream
+        self.start_event = None
+        self.end_event = None
+        self.elapsed_time_ms = 0.0
+
+    def start(self):
+        if not self.enable:
+            return
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+        self.start_event.record(stream=self.stream)
+
+    def stop(self):
+        if not self.enable:
+            return
+        self.end_event.record(stream=self.stream)
+        torch.cuda.synchronize(self.stream)
+        elapsed = self.start_event.elapsed_time(self.end_event)
+        self.elapsed_time_ms += elapsed
+        print(f"[{self.name}] Elapsed: {elapsed:.3f} ms")
+
+    def reset(self):
+        self.elapsed_time_ms = 0.0
+
+    def total(self):
+        return self.elapsed_time_ms
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Demo")
     parser.add_argument("--config", type=str, required=True, help="Directory containing the scene configs")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory for output")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--mode", type=str, default='', help="Run VGGT mode")
     parser.add_argument("--use_ba", action="store_true", default=False, help="Use BA for reconstruction")
     ######### BA parameters #########
     parser.add_argument(
@@ -106,7 +152,7 @@ def demo_fn(args):
     print(f"Using dtype: {dtype}")
 
     # Run VGGT for camera and depth estimation
-    model = VGGT()
+    model = VGGT(mode=args.mode)
     _URL = "weights/model.pt"
     model.load_state_dict(torch.load(_URL))
     model.eval()
@@ -118,7 +164,7 @@ def demo_fn(args):
     config = load_config(args.config)
     dataset = load_dataset(config, '', config)
     image_dir = os.path.dirname(dataset.color_paths[0])
-    image_path_list = dataset.color_paths[:20]
+    image_path_list = dataset.color_paths[:100]
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
     # Load images and original coordinates
@@ -133,7 +179,8 @@ def demo_fn(args):
 
     # Run VGGT to estimate camera and depth
     # Run with 518x518 images
-    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
+    with CudaTimer("RUN VGGT"):
+        extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
 
     if args.use_ba:

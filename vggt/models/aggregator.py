@@ -69,6 +69,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        mode=''
     ):
         super().__init__()
 
@@ -107,7 +108,8 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
-                    layer=_
+                    layer=_,
+                    mode=mode
                 )
                 for _ in range(depth)
             ]
@@ -215,19 +217,20 @@ class Aggregator(nn.Module):
         # ---- Step 3. run K-means ----
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
         labels = kmeans.fit_predict(X)
-        centers = kmeans.cluster_centers_
+        # centers = kmeans.cluster_centers_
 
         # ---- Step 4. find keyframes (closest to each cluster center) ----
-        keyframes = []
-        for i in range(n_clusters):
-            cluster_indices = torch.where(torch.tensor(labels) == i)[0]
-            cluster_feats = X[cluster_indices]
-            center = centers[i]
+        # keyframes = []
+        # for i in range(n_clusters):
+        #     cluster_indices = torch.where(torch.tensor(labels) == i)[0]
+        #     cluster_feats = X[cluster_indices]
+        #     center = centers[i]
 
-            # compute Euclidean distance to center
-            dists = ((cluster_feats - center) ** 2).sum(axis=1)
-            closest_idx = cluster_indices[dists.argmin()]
-            keyframes.append(closest_idx.item())
+        #     # compute Euclidean distance to center
+        #     print(cluster_feats.shape)
+        #     dists = ((cluster_feats - center) ** 2).sum(axis=1)
+        #     closest_idx = cluster_indices[dists.argmin()]
+        #     keyframes.append(closest_idx.item())
 
         # ---- Step 5. organize results ----
         clusters = []
@@ -237,7 +240,8 @@ class Aggregator(nn.Module):
         result = {
             "num_frames": num_frames,
             "clusters": clusters,
-            "keyframes": torch.tensor(keyframes, dtype=torch.long, device=device)
+            "ref_cluster": labels[0]
+            # "keyframes": torch.tensor(keyframes, dtype=torch.long, device=device)
         }
         return result
 

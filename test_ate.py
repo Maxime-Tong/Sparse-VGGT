@@ -105,12 +105,12 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
 
     return ape_stat
 
-timestamps, est_poses = read_colmap_poses('/data/xthuang/code/vggt/output/tum/desk1/sparse')
 
 args = parse_args()
 config = load_config(args.config)
 dataset = load_dataset(args, '', config)
 
+timestamps, est_poses = read_colmap_poses(args.output + '/sparse')
 N_images = len(timestamps)
 gt_poses = []
 for frame_idx in range(N_images):
@@ -119,5 +119,7 @@ for frame_idx in range(N_images):
     gt_poses.append(gt_pose)
 gt_poses = np.stack(gt_poses)
 
-evaluate_evo(gt_poses, est_poses, 'output/tmp', 'vggt', monocular=True)
+eval_dir = args.output+'/eval'
+os.makedirs(eval_dir, exist_ok=True)
+evaluate_evo(gt_poses, est_poses, eval_dir, 'vggt', monocular=True)
 

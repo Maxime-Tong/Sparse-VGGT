@@ -34,7 +34,8 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
-        layer=0
+        layer=0,
+        mode=''
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -52,9 +53,9 @@ class Attention(nn.Module):
         self.rope = rope
         self.layer = layer
         
-        self.use_hierarchy = True
+        self.mode = mode
 
-    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.4) -> torch.Tensor:
+    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.5) -> torch.Tensor:
         """
         Optimized Hierarchical Attention:
         - Coarse: cluster-level mean over frames (patch preserved for fine)
@@ -64,6 +65,7 @@ class Attention(nn.Module):
         B, H, N, D = q.shape
         S = hierarchy_data["num_frames"]
         clusters = hierarchy_data["clusters"]
+        ref_cluster = hierarchy_data["ref_cluster"]
         K = len(clusters)
         P = N // S
         device = q.device
@@ -83,32 +85,51 @@ class Attention(nn.Module):
         q_proto = torch.stack(q_proto, dim=2)
         k_proto = torch.stack(k_proto, dim=2)
         
+        patch_indices = []
+        top_patch_ratio = 0.5
+        top_k_patch = max(1, int(P * top_patch_ratio))
+        for ci in range(K):
+            q_local = q_proto[:, :, ci]
+            k_local = k_proto[:, :, ci]
+            attn_score = torch.matmul(q_local, k_local.transpose(-2, -1)) * self.scale # [B, H, P, P]
+            attn_score = attn_score.softmax(-1).mean(2).mean(1)[0]
+            _, top_indices = torch.topk(attn_score, k=top_k_patch)
+            patch_indices.append(top_indices)
+            del q_local, k_local
+
         # ---- Step 3. Coarse attention (frame-level mean only, no full patch flatten)
         # reduce patch dimension before computing cluster-to-cluster similarity
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
-            q_mean = q_proto.mean(dim=3)  # (B,H,K,D)
-            k_mean = k_proto.mean(dim=3)  # (B,H,K,D)
-            attn_scores = torch.matmul(q_mean, k_mean.transpose(-2, -1)) * self.scale  # (B,H,K,K)
-
-            # 平均head，找每个cluster最相关的topK
-            top_k = max(1, int(K * top_ratio))
-            _, top_idx = torch.topk(attn_scores.mean(dim=1), k=top_k, dim=-1)  # (B,K,top_k)
-            del q_mean, k_mean, attn_scores  
+        q_mean = q_proto.mean(dim=3)  # (B,H,K,D)
+        k_mean = k_proto.mean(dim=3)  # (B,H,K,D)
+        attn_scores = torch.matmul(q_mean, k_mean.transpose(-2, -1)) * self.scale  # (B,H,K,K)
+        attn_scores = attn_scores.softmax(-1)
+        
+        # 平均head，找每个cluster最相关的topK
+        top_k = max(1, int(K * top_ratio))
+        _, cluster_topk = torch.topk(attn_scores.mean(1), k=top_k, dim=-1)  # (B, K, top_k)
+        del q_mean, k_mean, attn_scores  
 
         # ---- Step 4. Fine attention ----
         out_frames = torch.zeros(B, H, S, P, D, device=device, dtype=q.dtype)
 
         for ci, frame_ids in enumerate(clusters):
             q_local = q[:, :, frame_ids, :, :].reshape(B, H, -1, D)
-            k_local = k[:, :, frame_ids, :, :].reshape(B, H, -1, D)
-            v_local = v[:, :, frame_ids, :, :].reshape(B, H, -1, D)
+            k_local = k[:, :, clusters[ref_cluster], :, :].reshape(B, H, -1, D)
+            v_local = v[:, :, clusters[ref_cluster], :, :].reshape(B, H, -1, D)
 
             # 添加 coarse 阶段最相关 cluster（只添加一次，使用缓存）
-            neighbor_clusters = top_idx[0, ci].tolist()
+            neighbor_clusters = cluster_topk[0, ci].tolist() # [top_k]
             for nc in neighbor_clusters:
-                if nc != ci: 
-                    k_local = torch.cat([k_local, k[:, :, clusters[nc], :, :].reshape(B, H, -1, D)], dim=2)
-                    v_local = torch.cat([v_local, v[:, :, clusters[nc], :, :].reshape(B, H, -1, D)], dim=2)
+                if nc != ref_cluster: 
+                    k_selected = k[:, :, clusters[nc], :, :]
+                    v_selected = v[:, :, clusters[nc], :, :]
+                    
+                    if 'P' in self.mode:
+                        k_selected = k_selected[:, :, :, patch_indices[nc]]
+                        v_selected = v_selected[:, :, :, patch_indices[nc]]
+                        
+                    k_local = torch.cat([k_local, k_selected.reshape(B, H, -1, D)], dim=2)
+                    v_local = torch.cat([v_local, v_selected.reshape(B, H, -1, D)], dim=2)
 
             # 稀疏 attention (coarse 约束 + chunked)
             out_local = F.scaled_dot_product_attention(q_local, k_local, v_local, dropout_p=0.0, is_causal=False).type(q.dtype)
@@ -117,8 +138,8 @@ class Attention(nn.Module):
 
             # 显式清理，防止 block 级内存占用累积
             del q_local, k_local, v_local, out_local
-            torch.cuda.empty_cache()
 
+        torch.cuda.empty_cache()
         return out_frames.view(B, H, N, D)
 
 
@@ -132,7 +153,7 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        if hierarchy_data is not None and self.use_hierarchy:
+        if hierarchy_data is not None and 'H' in self.mode:
             x = self._hierarchy_dot_product(q, k, v, hierarchy_data)
         elif self.fused_attn:
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
