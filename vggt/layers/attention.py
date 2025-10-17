@@ -55,7 +55,8 @@ class Attention(nn.Module):
         
         self.mode = mode
 
-    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.5) -> torch.Tensor:
+    @torch.amp.autocast('cuda')
+    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.8) -> torch.Tensor:
         """
         Optimized Hierarchical Attention:
         - Coarse: cluster-level mean over frames (patch preserved for fine)
@@ -66,6 +67,7 @@ class Attention(nn.Module):
         S = hierarchy_data["num_frames"]
         clusters = hierarchy_data["clusters"]
         ref_cluster = hierarchy_data["ref_cluster"]
+        keyframes = hierarchy_data["keyframes"]
         K = len(clusters)
         P = N // S
         device = q.device
@@ -76,38 +78,45 @@ class Attention(nn.Module):
         v = v.view(B, H, S, P, D)
 
         # ---- Step 2. cluster-level prototypes (mean over frames, preserve patch dimension) ----
-        q_proto, k_proto = [], []
-        for c in clusters:
-            q_proto.append(q[:, :, c, :, :].mean(dim=2))  # (B,H,P,D)
-            k_proto.append(k[:, :, c, :, :].mean(dim=2))
+        # q_proto, k_proto = [], []
+        # for c in clusters:
+        #     q_proto.append(q[:, :, c, :, :].mean(dim=2))  # (B,H,P,D)
+        #     k_proto.append(k[:, :, c, :, :].mean(dim=2))
+        # q_proto = torch.stack(q_proto, dim=2)
+        # k_proto = torch.stack(k_proto, dim=2)
 
         # (B,H,K,P,D)
-        q_proto = torch.stack(q_proto, dim=2)
-        k_proto = torch.stack(k_proto, dim=2)
+        q_proto = q[:, :, keyframes]
+        k_proto = k[:, :, keyframes]
         
-        patch_indices = []
-        top_patch_ratio = 0.5
+        top_patch_ratio = 0.2
         top_k_patch = max(1, int(P * top_patch_ratio))
-        for ci in range(K):
-            q_local = q_proto[:, :, ci]
-            k_local = k_proto[:, :, ci]
-            attn_score = torch.matmul(q_local, k_local.transpose(-2, -1)) * self.scale # [B, H, P, P]
-            attn_score = attn_score.softmax(-1).mean(2).mean(1)[0]
-            _, top_indices = torch.topk(attn_score, k=top_k_patch)
-            patch_indices.append(top_indices)
-            del q_local, k_local
+        attn_score = torch.matmul(q_proto, k_proto.transpose(-2, -1)) * self.scale # [B, H, K, P, P]
+        attn_score = attn_score.softmax(-1).mean(3).mean(1)[0] # [K, P]
+        patch_values, patch_indices = torch.topk(attn_score, k=top_k_patch)
+        del attn_score, patch_values
 
         # ---- Step 3. Coarse attention (frame-level mean only, no full patch flatten)
         # reduce patch dimension before computing cluster-to-cluster similarity
-        q_mean = q_proto.mean(dim=3)  # (B,H,K,D)
-        k_mean = k_proto.mean(dim=3)  # (B,H,K,D)
-        attn_scores = torch.matmul(q_mean, k_mean.transpose(-2, -1)) * self.scale  # (B,H,K,K)
+        patch_gather_indices = patch_indices[None, None, :, :, None].expand(B, H, -1, -1, D)
+        q_selected = torch.gather(
+            q_proto, # [B, H, K, P, D]
+            index=patch_gather_indices,
+            dim=3
+        ).view(B, H, -1, D)
+        k_selected = torch.gather(
+            k_proto,
+            index=patch_gather_indices,
+            dim=3
+        ).view(B, H, -1, D)
+        
+        attn_scores = torch.matmul(q_selected, k_selected.transpose(-2, -1)) * self.scale  # (B, H, K*top_k, K*top_k)
         attn_scores = attn_scores.softmax(-1)
         
         # 平均head，找每个cluster最相关的topK
         top_k = max(1, int(K * top_ratio))
-        _, cluster_topk = torch.topk(attn_scores.mean(1), k=top_k, dim=-1)  # (B, K, top_k)
-        del q_mean, k_mean, attn_scores  
+        _, cluster_topk = torch.topk(attn_scores.view(B, H, K, top_k_patch, K, top_k_patch).mean(dim=(1, 3, 5)), k=top_k, dim=-1)  # (B, K, K)
+        del q_selected, k_selected, attn_scores, q_proto, k_proto
 
         # ---- Step 4. Fine attention ----
         out_frames = torch.zeros(B, H, S, P, D, device=device, dtype=q.dtype)
@@ -138,8 +147,6 @@ class Attention(nn.Module):
 
             # 显式清理，防止 block 级内存占用累积
             del q_local, k_local, v_local, out_local
-
-        torch.cuda.empty_cache()
         return out_frames.view(B, H, N, D)
 
 

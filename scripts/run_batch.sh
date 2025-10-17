@@ -1,7 +1,7 @@
 #!/bin/bash
 
 datasets=('fr1_desk' 'fr2_xyz' 'fr3_office')
-methods=('none' 'H' 'HP')
+methods=('H' 'HP')
 result_file="result.txt"
 > "$result_file"  # 清空结果文件
 

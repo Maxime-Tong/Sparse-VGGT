@@ -24,7 +24,8 @@ def visualize_attention(attn_dict: dict, num_images: int, figsize: tuple = (12, 
         p = n_p // num_images
         # 重塑并使用max合并注意力头和patch维度
         attn_reshaped = attn.reshape(attn.shape[0], num_images, p, num_images, p)
-        attn_map = attn_reshaped.max(0).max(1).max(2)
+        print(attn_reshaped.shape)
+        attn_map = attn_reshaped[-1].max(1).max(2)
         processed_maps[layer] = attn_map
     
     # 绘制所有热力图（按排序后的层顺序）
@@ -56,7 +57,7 @@ layers = [8, 9, 10, 11, 12, 13, 14, 15]  # 目标层（这里即使顺序混乱�
 
 import torch
 import torch.nn.functional as F
-patch_tokens = torch.load('output/tmp/patch_tokens.pt')['x_norm_patchtokens']
+patch_tokens = torch.load('/data/xthuang/code/vggt/output/tmp/tokens_0_100_10_xyz.pt')['x_norm_patchtokens']
 N, P, D = patch_tokens.shape
 print(N, P, D)
 
@@ -68,7 +69,7 @@ tokens_np = patch_tokens.detach().cpu().numpy()
 token_sim = (tokens_np @ tokens_np.T)[np.newaxis, :, :]
 attn_dict[-1] = token_sim
 
-for file in os.listdir('output/tmp/attn_weights'):
+for file in os.listdir( 'output/tmp/attn_weights_0_100_10_xyz'):
     try:
         layer = int(file.split('_')[1].split('.')[0])  # 提取层号
     except (IndexError, ValueError):
@@ -76,7 +77,7 @@ for file in os.listdir('output/tmp/attn_weights'):
     
     if layer in layers:
         # 加载注意力权重
-        file_path = os.path.join('output/tmp/attn_weights', file)
+        file_path = os.path.join( 'output/tmp/attn_weights_0_100_10_xyz', file)
         attn_weight = np.load(file_path).squeeze(0)  # 保留[num_heads, seq_len, seq_len]
         print(f"Loaded {file}, shape: {attn_weight.shape}")
         attn_dict[layer] = attn_weight
