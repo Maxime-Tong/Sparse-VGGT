@@ -18,6 +18,8 @@ import torch.nn.functional as F
 
 from typing import Dict
 
+from vggt.utils.reduce import TokenReducer
+
 XFORMERS_AVAILABLE = False
 
 
@@ -54,9 +56,10 @@ class Attention(nn.Module):
         self.layer = layer
         
         self.mode = mode
+        self.reducer = TokenReducer(n_hashes=3, n_buckets=64)
 
     @torch.amp.autocast('cuda')
-    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.8) -> torch.Tensor:
+    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.2) -> torch.Tensor:
         """
         Optimized Hierarchical Attention:
         - Coarse: cluster-level mean over frames (patch preserved for fine)
@@ -73,18 +76,11 @@ class Attention(nn.Module):
         device = q.device
 
         # ---- Step 1. reshape ----
-        q = q.view(B, H, S, P, D)
-        k = k.view(B, H, S, P, D)
-        v = v.view(B, H, S, P, D)
+        q = q.view(B, H, S, -1, D)
+        k = k.view(B, H, S, -1, D)
+        v = v.view(B, H, S, -1, D)
 
         # ---- Step 2. cluster-level prototypes (mean over frames, preserve patch dimension) ----
-        # q_proto, k_proto = [], []
-        # for c in clusters:
-        #     q_proto.append(q[:, :, c, :, :].mean(dim=2))  # (B,H,P,D)
-        #     k_proto.append(k[:, :, c, :, :].mean(dim=2))
-        # q_proto = torch.stack(q_proto, dim=2)
-        # k_proto = torch.stack(k_proto, dim=2)
-
         # (B,H,K,P,D)
         q_proto = q[:, :, keyframes]
         k_proto = k[:, :, keyframes]
@@ -152,18 +148,47 @@ class Attention(nn.Module):
 
     def forward(self, x: Tensor, pos=None, hierarchy_data: Dict = None) -> Tensor:
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) # [3, B, H, N, D]
+        # Compute QKV and split (keep as minimal temp tensors)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)  # [3, B, H, N, D]
         q, k, v = qkv.unbind(0)
+        del qkv  # Free temp QKV tensor immediately
+        
         q, k = self.q_norm(q), self.k_norm(k)
-
+        
         if self.rope is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        if hierarchy_data is not None and 'H' in self.mode:
-            x = self._hierarchy_dot_product(q, k, v, hierarchy_data)
-        elif self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        if hierarchy_data is not None:
+            H, D = self.num_heads, self.head_dim
+            S = hierarchy_data['num_frames']
+            P = N // S
+
+            # Reduce tokens and merge Q/K/V with memory-efficient steps
+            self.reducer.compute_maps(x.view(S, P, C))  # (S, P, C) -> reduction maps
+            
+            # Merge Q with immediate view conversion and temp cleanup
+            # q_merged = self.reducer.merge(q.view(H, S, P, D)).view(B, H, -1, D)
+            # del q  # Free original Q after merging
+            
+            # Merge K with immediate view conversion and temp cleanup
+            k_merged = self.reducer.merge(k.view(H, S, P, D)).view(B, H, -1, D)
+            del k  # Free original K after merging
+            
+            # Merge V with immediate view conversion and temp cleanup
+            v_merged = self.reducer.merge(v.view(H, S, P, D)).view(B, H, -1, D)
+            del v  # Free original V after merging
+            
+            # Update to merged versions
+            k, v = k_merged, v_merged
+            # print("q:", q.shape, k.shape, v.shape)
+
+        # Attention computation (uses merged Q/K/V if hierarchy is active)
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(
+                q, k, v, 
+                dropout_p=self.attn_drop.p if self.training else 0.0
+            )     
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
@@ -171,6 +196,13 @@ class Attention(nn.Module):
             attn = self.attn_drop(attn)
             x = attn @ v
 
+        if hierarchy_data is not None:
+            # Unmerge and restore original shape
+            # x = self.reducer.unmerge(x.view(H, -1, D), (H, S, P, D)).view(B, H, N, D)
+            self.reducer.clean()  # Release reducer GPU memory immediately
+            del q, k, v  # Free merged Q/K/V after unmerge
+
+        # Final projection
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)

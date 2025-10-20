@@ -143,6 +143,8 @@ class Aggregator(nn.Module):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
         self.use_reentrant = False # hardcoded to False
+        
+        self.mode = mode
 
     def __build_patch_embed__(
         self,
@@ -272,7 +274,7 @@ class Aggregator(nn.Module):
 
         _, P, C = patch_tokens.shape
         hierarchy_data = None
-        if not self.training:
+        if not self.training and self.mode != '':
             hierarchy_data = self._cluster_frames(patch_tokens)
 
         # Expand camera and register tokens to match batch size and sequence length
