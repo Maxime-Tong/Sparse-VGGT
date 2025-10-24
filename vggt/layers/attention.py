@@ -56,10 +56,10 @@ class Attention(nn.Module):
         self.layer = layer
         
         self.mode = mode
-        self.reducer = TokenReducer(n_hashes=3, n_buckets=64)
+        self.reducer = TokenReducer(scale=self.scale, n_hashes=3, n_buckets=32)
 
     @torch.amp.autocast('cuda')
-    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.2) -> torch.Tensor:
+    def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict, top_ratio: float = 0.5) -> torch.Tensor:
         """
         Optimized Hierarchical Attention:
         - Coarse: cluster-level mean over frames (patch preserved for fine)
@@ -68,83 +68,103 @@ class Attention(nn.Module):
 
         B, H, N, D = q.shape
         S = hierarchy_data["num_frames"]
-        clusters = hierarchy_data["clusters"]
-        ref_cluster = hierarchy_data["ref_cluster"]
-        keyframes = hierarchy_data["keyframes"]
+        clusters = hierarchy_data["clusters"]   # list of lists of frame indices, len K
         K = len(clusters)
+        keyframes = hierarchy_data["keyframes"]
         P = N // S
         device = q.device
+        dtype = q.dtype
 
-        # ---- Step 1. reshape ----
-        q = q.view(B, H, S, -1, D)
-        k = k.view(B, H, S, -1, D)
-        v = v.view(B, H, S, -1, D)
+        # reshape to (B, H, S, P, D)
+        q = q.view(B, H, S, P, D)
+        k = k.view(B, H, S, P, D)
+        v = v.view(B, H, S, P, D)
 
-        # ---- Step 2. cluster-level prototypes (mean over frames, preserve patch dimension) ----
-        # (B,H,K,P,D)
-        q_proto = q[:, :, keyframes]
+        # prototypes from keyframes: (B, H, K, P, D)
+        q_proto = q[:, :, keyframes]   # keyframes length == K
         k_proto = k[:, :, keyframes]
-        
-        top_patch_ratio = 0.2
-        top_k_patch = max(1, int(P * top_patch_ratio))
-        attn_score = torch.matmul(q_proto, k_proto.transpose(-2, -1)) * self.scale # [B, H, K, P, P]
-        attn_score = attn_score.softmax(-1).mean(3).mean(1)[0] # [K, P]
-        patch_values, patch_indices = torch.topk(attn_score, k=top_k_patch)
-        del attn_score, patch_values
 
-        # ---- Step 3. Coarse attention (frame-level mean only, no full patch flatten)
-        # reduce patch dimension before computing cluster-to-cluster similarity
-        patch_gather_indices = patch_indices[None, None, :, :, None].expand(B, H, -1, -1, D)
-        q_selected = torch.gather(
-            q_proto, # [B, H, K, P, D]
-            index=patch_gather_indices,
-            dim=3
-        ).view(B, H, -1, D)
-        k_selected = torch.gather(
-            k_proto,
-            index=patch_gather_indices,
-            dim=3
-        ).view(B, H, -1, D)
+        # select top-k patches per cluster using averaged coarse scores
+        top_k_patch = max(1, int(P * top_ratio))
+        # compute per-cluster per-patch score, average over B,H
+        attn_score = torch.sum(q_proto * k_proto, dim=-1) * self.scale   # (B,H,K,P)
+        attn_score = attn_score.softmax(-1).mean(dim=(0, 1))              # (K, P)
+        _, patch_indices = torch.topk(attn_score, k=top_k_patch, dim=-1)  # (K, top_k_patch)
+        del attn_score
         
-        attn_scores = torch.matmul(q_selected, k_selected.transpose(-2, -1)) * self.scale  # (B, H, K*top_k, K*top_k)
-        attn_scores = attn_scores.softmax(-1)
+        # gather selected patches from prototypes
+        # prepare index for gather on dim=3 (patch dim)
+        patch_idx_exp = patch_indices[None, None, :, :, None].expand(B, H, -1, -1, D)  # (B,H,K,top_k_patch,D)
+        q_sel = torch.gather(q_proto, index=patch_idx_exp, dim=3).view(B, H, -1, D)    # (B, H, K*top_k_patch, D)
+        k_sel = torch.gather(k_proto, index=patch_idx_exp, dim=3).view(B, H, -1, D)
         
-        # 平均head，找每个cluster最相关的topK
-        top_k = max(1, int(K * top_ratio))
-        _, cluster_topk = torch.topk(attn_scores.view(B, H, K, top_k_patch, K, top_k_patch).mean(dim=(1, 3, 5)), k=top_k, dim=-1)  # (B, K, K)
-        del q_selected, k_selected, attn_scores, q_proto, k_proto
+        # compute inter-patch attention aggregated into cluster-to-cluster scores
+        attn_mat = torch.matmul(q_sel, k_sel.transpose(-2, -1)) * self.scale   # (B,H,K*tk,K*tk)
+        # reshape to (B,H,K,tk,K,tk) then max over batch/head and patch dims to get (K,K)
+        tk = top_k_patch
+        attn_cluster = attn_mat.softmax(-1).view(B, H, K, tk, K, tk)
+        cluster_scores = torch.amax(attn_cluster, dim=(0, 1, 3, 5))  # (K, K)
+        # keep as tensor on device to avoid cpu transfer
+        del q_sel, k_sel, attn_mat, attn_cluster, q_proto, k_proto
+        torch.cuda.empty_cache()
 
-        # ---- Step 4. Fine attention ----
-        out_frames = torch.zeros(B, H, S, P, D, device=device, dtype=q.dtype)
-
+        # prepare output container
+        out_frames = torch.zeros(B, H, S, P, D, device=device, dtype=dtype)
+        # For each cluster, gather neighbor clusters (vectorized selection per neighbor)
         for ci, frame_ids in enumerate(clusters):
-            q_local = q[:, :, frame_ids, :, :].reshape(B, H, -1, D)
-            k_local = k[:, :, clusters[ref_cluster], :, :].reshape(B, H, -1, D)
-            v_local = v[:, :, clusters[ref_cluster], :, :].reshape(B, H, -1, D)
+            # q_local: queries for frames in this cluster, shape (B, H, Lq, D) where Lq = len(frame_ids)*P
+            Lq = len(frame_ids) * P
+            q_local = q[:, :, frame_ids, :, :].reshape(B, H, Lq, D)
 
-            # 添加 coarse 阶段最相关 cluster（只添加一次，使用缓存）
-            neighbor_clusters = cluster_topk[0, ci].tolist() # [top_k]
-            for nc in neighbor_clusters:
-                if nc != ref_cluster: 
-                    k_selected = k[:, :, clusters[nc], :, :]
-                    v_selected = v[:, :, clusters[nc], :, :]
-                    
-                    if 'P' in self.mode:
-                        k_selected = k_selected[:, :, :, patch_indices[nc]]
-                        v_selected = v_selected[:, :, :, patch_indices[nc]]
-                        
-                    k_local = torch.cat([k_local, k_selected.reshape(B, H, -1, D)], dim=2)
-                    v_local = torch.cat([v_local, v_selected.reshape(B, H, -1, D)], dim=2)
+            # neighbor mask: select clusters with significant cross-score
+            scores_row = cluster_scores[ci]                                  # (K,)
+            thr = 0.1 * torch.mean(scores_row)
+            neighbor_mask = scores_row >= thr
+            # always include self if numerical issues
+            neighbor_mask[ci] = True
 
-            # 稀疏 attention (coarse 约束 + chunked)
-            out_local = F.scaled_dot_product_attention(q_local, k_local, v_local, dropout_p=0.0, is_causal=False).type(q.dtype)
+            selected_nc = torch.nonzero(neighbor_mask, as_tuple=False).squeeze(-1)
+            if selected_nc.numel() == 0:
+                # no neighbors (shouldn't happen because self included), skip
+                continue
 
-            out_frames[:, :, frame_ids, :, :] = out_local.view(B, H, len(frame_ids), P, D)
+            # Build k_local and v_local by concatenating selected clusters' frames and their top patches.
+            # This inner loop iterates only over selected neighbor clusters (usually small).
+            k_parts = []
+            v_parts = []
+            for nc in selected_nc.tolist():
+                # frames in cluster nc
+                frames_nc = clusters[nc]  # python list of frame indices
+                if len(frames_nc) == 0:
+                    continue
+                # select patches for this cluster: index into patch dim
+                pidx = patch_indices[nc]  # (top_k_patch,)
+                # gather keys/vals: shape (B, H, frames_nc, top_k_patch, D)
+                k_sel_nc = k[:, :, frames_nc, :, :][:, :, :, pidx, :].reshape(B, H, -1, D)
+                v_sel_nc = v[:, :, frames_nc, :, :][:, :, :, pidx, :].reshape(B, H, -1, D)
+                k_parts.append(k_sel_nc)
+                v_parts.append(v_sel_nc)
 
-            # 显式清理，防止 block 级内存占用累积
-            del q_local, k_local, v_local, out_local
+            if len(k_parts) == 0:
+                # no neighbor content, skip
+                continue
+
+            # concatenate along source-length dim
+            k_local = torch.cat(k_parts, dim=2)   # (B, H, Lk, D)
+            v_local = torch.cat(v_parts, dim=2)   # (B, H, Lk, D)
+
+            # compute attention: queries q_local attend to keys k_local -> outputs (B,H,Lq,D)
+            # use PyTorch scaled_dot_product_attention for best performance
+            out_local = F.scaled_dot_product_attention(q_local, k_local, v_local, dropout_p=0.0, is_causal=False)
+            # out_local = out_local.type(dtype)
+
+            # write back to output frames (reshape Lq -> (len(frame_ids), P))
+            out_frames[:, :, frame_ids, :, :] += out_local.view(B, H, len(frame_ids), P, D)
+
+            # free temporaries to reduce peak memory
+            del q_local, k_local, v_local, out_local, k_parts, v_parts
+
         return out_frames.view(B, H, N, D)
-
 
     def forward(self, x: Tensor, pos=None, hierarchy_data: Dict = None) -> Tensor:
         B, N, C = x.shape
@@ -158,33 +178,11 @@ class Attention(nn.Module):
         if self.rope is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
-
-        if hierarchy_data is not None:
-            H, D = self.num_heads, self.head_dim
-            S = hierarchy_data['num_frames']
-            P = N // S
-
-            # Reduce tokens and merge Q/K/V with memory-efficient steps
-            self.reducer.compute_maps(x.view(S, P, C))  # (S, P, C) -> reduction maps
             
-            # Merge Q with immediate view conversion and temp cleanup
-            # q_merged = self.reducer.merge(q.view(H, S, P, D)).view(B, H, -1, D)
-            # del q  # Free original Q after merging
-            
-            # Merge K with immediate view conversion and temp cleanup
-            k_merged = self.reducer.merge(k.view(H, S, P, D)).view(B, H, -1, D)
-            del k  # Free original K after merging
-            
-            # Merge V with immediate view conversion and temp cleanup
-            v_merged = self.reducer.merge(v.view(H, S, P, D)).view(B, H, -1, D)
-            del v  # Free original V after merging
-            
-            # Update to merged versions
-            k, v = k_merged, v_merged
-            # print("q:", q.shape, k.shape, v.shape)
-
-        # Attention computation (uses merged Q/K/V if hierarchy is active)
-        if self.fused_attn:
+        if hierarchy_data is not None and 'P' in self.mode:
+            # x = self.reducer.cluster_attention(q, k, v, hierarchy_data)
+            x = self._hierarchy_dot_product(q, k, v, hierarchy_data)
+        elif self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v, 
                 dropout_p=self.attn_drop.p if self.training else 0.0
@@ -195,12 +193,6 @@ class Attention(nn.Module):
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
-
-        if hierarchy_data is not None:
-            # Unmerge and restore original shape
-            # x = self.reducer.unmerge(x.view(H, -1, D), (H, S, P, D)).view(B, H, N, D)
-            self.reducer.clean()  # Release reducer GPU memory immediately
-            del q, k, v  # Free merged Q/K/V after unmerge
 
         # Final projection
         x = x.transpose(1, 2).reshape(B, N, C)

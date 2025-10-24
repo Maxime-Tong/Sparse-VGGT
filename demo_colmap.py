@@ -64,7 +64,7 @@ class CudaTimer:
         torch.cuda.synchronize(self.stream)
         elapsed = self.start_event.elapsed_time(self.end_event)
         self.elapsed_time_ms += elapsed
-        print(f"[{self.name}] Elapsed: {elapsed:.3f} ms")
+        print(f"[{self.name}] Elapsed: {elapsed/1000:.3f} [s]")
 
     def reset(self):
         self.elapsed_time_ms = 0.0
@@ -164,7 +164,7 @@ def demo_fn(args):
     config = load_config(args.config)
     dataset = load_dataset(config, '', config)
     image_dir = os.path.dirname(dataset.color_paths[0])
-    image_path_list = dataset.color_paths[:100]
+    image_path_list = dataset.color_paths[:200:10]
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
     # Load images and original coordinates

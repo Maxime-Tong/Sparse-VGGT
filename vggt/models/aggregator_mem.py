@@ -27,6 +27,20 @@ logger = logging.getLogger(__name__)
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
+import csv
+import time
+
+def _print_mem(stage: str, log_to_file=False, file_path="vggt_aggregator_mem_log.csv"):
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    max_alloc = torch.cuda.max_memory_allocated() / 1024**2
+    msg = f"[MEM] {stage:<30} alloc={alloc:8.1f}MB | reserved={reserved:8.1f}MB | peak={max_alloc:8.1f}MB"
+    print(msg)
+    if log_to_file:
+        with open(file_path, "a") as f:
+            csv.writer(f).writerow([stage, alloc, reserved, max_alloc])
+
 
 class Aggregator(nn.Module):
     """
@@ -150,6 +164,8 @@ class Aggregator(nn.Module):
         self.use_reentrant = False # hardcoded to False
         
         self.mode = mode
+        self.enable_mem_log = True
+        self.log_to_file = True
 
     def __build_patch_embed__(
         self,
@@ -231,45 +247,39 @@ class Aggregator(nn.Module):
         return result
 
     def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
-        """
-        Args:
-            images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
-                B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
-
-        Returns:
-            (list[torch.Tensor], int):
-                The list of outputs from the attention blocks,
-                and the patch_start_idx indicating where patch tokens begin.
-        """
         B, S, C_in, H, W = images.shape
+        if self.enable_mem_log:
+            _print_mem("Start Aggregator", self.log_to_file)
 
-        if C_in != 3:
-            raise ValueError(f"Expected 3 input channels, got {C_in}")
-
-        # Normalize images and reshape for patch embed
+        # Normalize
         images = (images - self._resnet_mean) / self._resnet_std
+        if self.enable_mem_log:
+            _print_mem("After normalization", self.log_to_file)
 
-        # Reshape to [B*S, C, H, W] for patch embedding
+        # Patch embedding
         images = images.view(B * S, C_in, H, W)
         patch_tokens = self.patch_embed(images)
-        
-        # Save patch_tokens
-        # torch.save(patch_tokens, 'output/tmp/patch_tokens.pt')
+        if self.enable_mem_log:
+            _print_mem("After patch_embed", self.log_to_file)
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
-        _, P, C = patch_tokens.shape
+        # optional frame clustering
         hierarchy_data = None
         if not self.training and self.mode != '':
+            t0 = time.time()
             hierarchy_data = self._cluster_frames(patch_tokens)
+            if self.enable_mem_log:
+                print(f"[INFO] Frame clustering took {time.time()-t0:.2f}s")
+                _print_mem("After _cluster_frames", self.log_to_file)
 
-        # Expand camera and register tokens to match batch size and sequence length
+        # token preparation
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
         register_token = slice_expand_and_flatten(self.register_token, B, S)
-
-        # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        if self.enable_mem_log:
+            _print_mem("After token concatenation", self.log_to_file)
 
         pos = None
         if self.rope is not None:
@@ -281,8 +291,11 @@ class Aggregator(nn.Module):
             pos = pos + 1
             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
+            
+        if self.enable_mem_log:
+            _print_mem("After pos embedding", self.log_to_file)
 
-        # update P because we added special tokens
+        # alternating attention blocks
         _, P, C = tokens.shape
         frame_idx = 0
         global_idx = 0
@@ -291,15 +304,21 @@ class Aggregator(nn.Module):
         for layer_id in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
+                    if self.enable_mem_log:
+                        _print_mem(f"Before frame block {frame_idx}", self.log_to_file)
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
+                    if self.enable_mem_log:
+                        _print_mem(f"After frame block {frame_idx}", self.log_to_file)
+
                 elif attn_type == "global":
-                    tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos, hierarchy_data=hierarchy_data
-                    )
-                else:
-                    raise ValueError(f"Unknown attention type: {attn_type}")
+                    if self.enable_mem_log:
+                        _print_mem(f"Before global block {global_idx}", self.log_to_file)
+                        tokens, global_idx, global_intermediates = self._process_global_attention(
+                            tokens, B, S, P, C, global_idx, pos=pos, hierarchy_data=hierarchy_data
+                        )
+                        _print_mem(f"After global block {global_idx}", self.log_to_file)
 
             intermediates_frames = [4, 11, 17, 23]
             if 'L' not in self.mode or layer_id in intermediates_frames:
@@ -307,11 +326,15 @@ class Aggregator(nn.Module):
                     # concat frame and global intermediates, [B x S x P x 2C]
                     concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                     output_list.append(concat_inter)
-
+                    
+        if self.enable_mem_log:
+            _print_mem("End of Aggregator", self.log_to_file)
         del concat_inter
         del frame_intermediates
         del global_intermediates
+
         return output_list, self.patch_start_idx
+
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """

@@ -85,7 +85,7 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ape_metric.process_data(data)
     ape_stat = ape_metric.get_statistic(metrics.StatisticsType.rmse)
     ape_stats = ape_metric.get_all_statistics()
-    print(f"RMSE ATE {ape_stat}[m]")
+    print(f"[TEST ATE] RMSE ATE: {ape_stat} [m]")
 
     plot_mode = evo.tools.plot.PlotMode.xy
     fig = plt.figure()

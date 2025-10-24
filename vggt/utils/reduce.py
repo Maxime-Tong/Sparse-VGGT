@@ -1,160 +1,157 @@
 import torch
 import torch.nn.functional as F
+from typing import Dict
 
 class TokenReducer:
-    """
-    LSH-based TokenReducer
-    ---------------------------
-    Input:
-        tokens: (S, P, C)
-    Output:
-        merged_indices: List[Tensor]
-            Each element is (num_buckets_s, variable-length index list)
-            Representing patch indices under each bucket in frame s
-    """
-
-    def __init__(self, n_hashes=4, n_buckets=4, seed=42, n_special_tokens=5, device=None):
+    def __init__(self, scale, n_hashes=4, n_buckets=4, seed=42, device=None):
+        self.scale = scale
         self.n_hashes = n_hashes
         self.n_buckets = n_buckets
+        self.topk_ratio = 0.5
         self.seed = seed
-        self.n_special_tokens = n_special_tokens
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(seed)
         self.proj = None
-        self.reduction_maps = None  # Stores {bucket_id -> patch_indices} for each frame
-        self.global_bucket_map = None  # Stores [(frame_idx, local_bucket_idx)]
 
     def _init_proj(self, C):
-        """Initialize random projection matrix"""
         self.proj = torch.randn(self.n_hashes, C, self.n_buckets, device=self.device)
+        self.proj = F.normalize(self.proj, dim=1)
 
-    @torch.no_grad()
-    def compute_maps(self, tokens: torch.Tensor):
-        """
-        Perform LSH clustering on input tokens, return bucket→patch mappings
-        Args:
-            tokens: (S, P, C)
-        Returns:
-            reduction_maps: List[Dict[int, Tensor]]
-                Mapping from hash bucket index to patch ids for each frame
-        """
-        assert tokens.dim() == 3, "tokens must have shape (S, P, C)"
-        S, P, C = tokens.shape
-        n_special = self.n_special_tokens
-        p_normal = P - n_special
+    def compute_maps(self, tokens: torch.Tensor, hierarchy_data: Dict):
+        B, H, N, C = tokens.shape
+        assert B == 1
+        
+        S = hierarchy_data['num_frames']
+        P = N // S
+        D = H * C
+        tokens = tokens.transpose(1, 2).reshape(S, P, D)
+        
         if self.proj is None:
-            self._init_proj(C)
+            self._init_proj(D)
         tokens = F.normalize(tokens, dim=-1)
-        reduction_maps = []
-
-        for s in range(S):
-            feats = tokens[s]  # (P, C)
+        
+        clusters = hierarchy_data['clusters']
+        
+        n_global_cluster = 0
+        global_cluster_map = []
+        for cluster in clusters:
+            cluster_feats = tokens[cluster]
+            Lp = len(cluster) * P
+            feats = cluster_feats.view(Lp, D)
             
-            frame_map = {}
-            for i in range(n_special):
-                frame_map[-i-1] = torch.tensor([i], device=self.device)
+            hash_logits = torch.einsum("pc,hcb->hpb", feats, self.proj)
+            hash_codes = torch.argmax(hash_logits, dim=-1)
+            del hash_logits
             
-            # Compute LSH hash with temporary tensors
-            normal_feats = feats[n_special:]
-            hash_logits = torch.einsum("pc,hcb->hpb", normal_feats, self.proj)
-            hash_codes = torch.argmax(hash_logits, dim=-1)  # (n_hashes, P)
-            del hash_logits  # Free immediate temporary
-            
-            # Combine into global bucket code
-            combined_code = torch.zeros(p_normal, dtype=torch.long, device=self.device)
+            combined_code = torch.zeros(Lp, dtype=torch.long, device=self.device)
             base = 1
             for i in range(self.n_hashes):
                 combined_code += hash_codes[i] * base
                 base *= self.n_buckets
-            del hash_codes  # Free after use
+            del hash_codes
             
-            # Build bucket→patch indices mapping
             unique_codes, inverse = torch.unique(combined_code, return_inverse=True)
-            del combined_code  # Free after unique computation
+            del combined_code
             
-            for b_id in range(len(unique_codes)):
-                mask = inverse == b_id
-                patch_ids = torch.nonzero(mask, as_tuple=True)[0] + n_special
-                frame_map[b_id] = patch_ids
-            del inverse  # Free per-frame temporary
-            reduction_maps.append(frame_map)
+            global_cluster_map += [inverse + n_global_cluster]
+            n_global_cluster += len(unique_codes)
+            
+        global_cluster_map = torch.cat(global_cluster_map, dim=-1)
+        return global_cluster_map, n_global_cluster
+    
+    def reorganize_tokens(self, feats, cluster_map):
+        B, H, N, C = feats.shape
+        device = feats.device
 
-        self.reduction_maps = reduction_maps
-        return reduction_maps
+        sorted_indices = torch.argsort(cluster_map)
+        feats_agg = feats[:, :, sorted_indices]
+        sorted_cluster_ids = cluster_map[sorted_indices]
+        
+        cluster_boundaries = torch.cat([
+            torch.tensor([0], device=device),
+            torch.where(sorted_cluster_ids[1:] != sorted_cluster_ids[:-1])[0] + 1,
+            torch.tensor([N], device=device)
+        ])
+        
+        return feats_agg, sorted_indices, cluster_boundaries
+    
 
-    @torch.no_grad()
-    def merge(self, feats: torch.Tensor):
-        """
-        Merge features by averaging based on reduction_maps, concatenate all frames
-        Args:
-            feats: (H, S, P, C)
-        Returns:
-            merged_feats: (H, total_bucket_num, C)
-        """
-        assert self.reduction_maps is not None, "Call reduce() before merge()."
-        H, S, P, C = feats.shape
-        merged_feats = []
-        self.global_bucket_map = []  # [(frame_idx, local_bucket_idx)]
-
-        for s in range(S):
-            frame_map = self.reduction_maps[s]
-            bucket_feats = []
-            for b_id, patch_ids in frame_map.items():
-                selected = feats[:, s, patch_ids, :]  # (H, n_patches_in_bucket, C)
-                mean_feat = selected.mean(dim=1, keepdim=True)  # (H, 1, C)
-                bucket_feats.append(mean_feat)
-                self.global_bucket_map.append((s, b_id))
-                del selected  # Free per-selection temporary
-            merged_frame = torch.cat(bucket_feats, dim=1)  # (H, num_bucket_s, C)
-            merged_feats.append(merged_frame)
-            del bucket_feats  # Free per-frame list
-
-        merged_feats = torch.cat(merged_feats, dim=1)  # (H, total_bucket_num, C)
-        return merged_feats
-
-    @torch.no_grad()
-    def unmerge(self, merged_feats: torch.Tensor, full_shape):
-        """
-        Broadcast merged features back to original patch positions
-        Args:
-            merged_feats: (H, total_bucket_num, C)
-            full_shape: (H, S, P, C)
-        Returns:
-            unmerged_feats: (H, S, P, C)
-        """
-        H, S, P, C = full_shape
-        assert self.reduction_maps is not None
-        assert self.global_bucket_map is not None
-
-        device = merged_feats.device
-        unmerged = torch.zeros(full_shape, device=device, dtype=merged_feats.dtype)
-
-        for global_b_id, (frame_idx, local_b_id) in enumerate(self.global_bucket_map):
-            patch_ids = self.reduction_maps[frame_idx][local_b_id]
-            unmerged[:, frame_idx, patch_ids, :] = merged_feats[:, global_b_id, :].unsqueeze(1)
-
-        return unmerged
+    def compute_centroids(self, feats, ranges, n_cluster):
+        centroids = []
+        for i in range(n_cluster):
+            feats_local = feats[:, :, ranges[i]:ranges[i+1]]
+            centroid = feats_local.mean(dim=2)
+            centroids.append(centroid)
+        centroids = torch.stack(centroids, dim=2)
+        return centroids            
+    
+    def cluster_attention(self, q, k, v, hierarchy_data):
+        B, H, N, C = q.shape
+        device = q.device
+        
+        cluster_map_q, Kq = self.compute_maps(q, hierarchy_data)
+        cluster_map_k, Kk = self.compute_maps(k, hierarchy_data)
+        
+        q_agg, inverse_q, cluster_q_ranges = self.reorganize_tokens(q, cluster_map_q)
+        k_agg, inverse_k, cluster_k_ranges = self.reorganize_tokens(k, cluster_map_k)
+        v_agg = v[:, :, inverse_k]
+        
+        proto_q = self.compute_centroids(q_agg, cluster_q_ranges, Kq)
+        proto_k = self.compute_centroids(k_agg, cluster_k_ranges, Kk)
+        
+        attn = torch.matmul(proto_q, proto_k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(-1).view(B, H, Kq, Kk).mean(dim=(0, 1))
+        
+        topk = max(1, int(Kk * self.topk_ratio))
+        _, topk_clusters = torch.topk(attn, k=topk, dim=-1)
+        del attn
+        
+        chunk_size = 64
+        out = torch.zeros_like(q)
+        
+        cluster_q_ranges_list = cluster_q_ranges.tolist()
+        
+        start_cluster = 0
+        while start_cluster < Kq:
+            end_cluster = min(start_cluster + chunk_size, Kq)
+            
+            # Create attention mask for current chunk
+            chunk_size_total = cluster_q_ranges_list[end_cluster] - cluster_q_ranges_list[start_cluster]
+            
+            # Vectorized attention mask creation
+            attn_mask = torch.zeros(chunk_size_total, N, device=device, dtype=torch.bool)
+            
+            # Set attention for top-k clusters
+            for i, cluster_idx in enumerate(range(start_cluster, end_cluster)):
+                cluster_start = cluster_q_ranges_list[cluster_idx] - cluster_q_ranges_list[start_cluster]
+                cluster_end = cluster_q_ranges_list[cluster_idx + 1] - cluster_q_ranges_list[start_cluster]
+                attn_mask[cluster_start:cluster_end, topk_clusters[cluster_idx]] = True
+            
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0).expand(B, H, chunk_size_total, N)
+            
+            # Extract current chunk
+            start_idx = cluster_q_ranges_list[start_cluster]
+            end_idx = cluster_q_ranges_list[end_cluster]
+            
+            # Use sparse attention for efficiency
+            q_chunk = q_agg[:, :, start_idx:end_idx]
+            
+            # Apply masked attention
+            out_chunk = F.scaled_dot_product_attention(
+                q_chunk, k_agg, v_agg,
+                attn_mask=attn_mask,
+                dropout_p=0.0
+            )
+            
+            out[:, :, start_idx:end_idx] = out_chunk
+            start_cluster = end_cluster
+        
+        # Restore original token order
+        out = out[:, :, torch.argsort(inverse_q)]
+        return out
 
     def clean(self):
-        """Release all GPU memory occupied by the TokenReducer instance"""
-        # Clear projection matrix
         if self.proj is not None:
             del self.proj
             self.proj = None
-        
-        # Clear reduction maps and their contained tensors
-        if self.reduction_maps is not None:
-            for frame_map in self.reduction_maps:
-                for key in list(frame_map.keys()):
-                    del frame_map[key]
-            del self.reduction_maps
-            self.reduction_maps = None
-        
-        # Clear global bucket map
-        if self.global_bucket_map is not None:
-            del self.global_bucket_map
-            self.global_bucket_map = None
-        
-        # Explicitly trigger CUDA memory cleanup
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
