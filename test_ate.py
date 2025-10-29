@@ -4,6 +4,7 @@ import argparse
 
 import os
 import matplotlib.pyplot as plt
+import cv2
 
 import evo
 from evo.core import metrics, trajectory
@@ -22,6 +23,12 @@ def parse_args():
     parser.add_argument("--output", type=str, required=True, help="Directory for saving output")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
+
+def read_depth_bin(file_path, shape, dtype=np.float32):
+    with open(file_path, 'rb') as f:
+        byte_data = f.read()
+    depth_map = np.frombuffer(byte_data, dtype=dtype).reshape(shape)
+    return depth_map
 
 def read_colmap_poses(colmap_path, camera_type="SIMPLE_PINHOLE"):
     reconstruction = pycolmap.Reconstruction(colmap_path)
@@ -105,6 +112,12 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
 
     return ape_stat
 
+def depth_l1_loss(pred_depths, gt_depths):
+    abs_error = np.abs(pred_depths - gt_depths)
+    valid_mask = (gt_depths > 0) & (pred_depths > 0)
+    abs_error = abs_error[valid_mask]
+    return np.sum(abs_error) / np.sum(valid_mask)
+
 
 args = parse_args()
 config = load_config(args.config)
@@ -112,14 +125,31 @@ dataset = load_dataset(args, '', config)
 
 timestamps, est_poses = read_colmap_poses(args.output + '/sparse')
 N_images = len(timestamps)
+est_depths = read_depth_bin(args.output + '/sparse/depths.bin', (N_images, 518, 518))
+
 gt_poses = []
-for frame_idx in range(N_images):
+gt_depths = []
+for frame_idx in range(0, N_images):
     gt_color, gt_depth, gt_w2c = dataset[frame_idx]
     gt_pose = np.linalg.inv(gt_w2c.cpu().numpy())
     gt_poses.append(gt_pose)
+    gt_depths.append(gt_depth)
 gt_poses = np.stack(gt_poses)
+gt_depths = np.stack(gt_depths)
 
 eval_dir = args.output+'/eval'
 os.makedirs(eval_dir, exist_ok=True)
 evaluate_evo(gt_poses, est_poses, eval_dir, 'vggt', monocular=True)
+
+H, W = gt_depths.shape[1:]
+resized_depths = np.zeros(gt_depths.shape, dtype=est_depths.dtype)
+for i in range(N_images):
+    resized_depths[i] = cv2.resize(
+        est_depths[i], 
+        (W, H), 
+        interpolation=cv2.INTER_CUBIC 
+    )
+l1_loss = depth_l1_loss(resized_depths, gt_depths)
+print(f"[TEST DEPTH] DEPTH: {l1_loss} [m]")
+
 

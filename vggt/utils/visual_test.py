@@ -1,7 +1,13 @@
-import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
+import cv2
+import numpy as np
+import math
+
+import torch
 from torch.nn.functional import cosine_similarity
+
+from typing import Dict, List, Optional, Tuple
 
 def plot_qk_similarity_heatmap(q: torch.Tensor, 
                                k: torch.Tensor, 
@@ -68,3 +74,80 @@ def plot_qk_similarity_heatmap(q: torch.Tensor,
     plt.tight_layout()
     plt.savefig(f"output/tmp/q_k_sim/{title}.png")
     return ax  # 返回轴对象，方便后续处理
+
+def visualize_patches_on_image(data, ax, title='Attention Patches', alpha=0.3):
+    """
+    在原图上以黄色渐变高亮选中的patch（按patch_indices顺序由亮到暗）
+    
+    Args:
+        data: dict 包含
+            - image: RGB图像 (H, W, 3)
+            - selected_patches: 被选中patch索引list
+            - patch_size: 每个patch的大小
+        ax: matplotlib Axes
+        title: 图标题
+        alpha: 透明度（控制总体视觉强度）
+    """
+    image = data['image']
+    patch_indices = data['selected_patches']
+    patch_size = data['patch_size']
+
+    H, W, _ = image.shape
+
+    def _compute_patch_coordinates(patch_id):
+        patches_per_row = math.ceil(W / patch_size)
+        row = patch_id // patches_per_row
+        col = patch_id % patches_per_row
+        y_start = row * patch_size
+        x_start = col * patch_size
+        return x_start, y_start, patch_size, patch_size
+
+    # 显示原图
+    ax.imshow(image)
+    ax.set_title(title)
+    ax.axis('off')
+
+    # 创建RGBA图层
+    overlay = np.zeros((H, W, 4), dtype=np.float32)
+    base_color = np.array([1.0, 1.0, 0.0])  # 黄色 (R,G,B)
+
+    # 亮度渐变：前→亮，后→暗
+    n = len(patch_indices)
+    brightness_levels = np.linspace(1.0, 0.4, n)  # 可调范围 [亮, 暗]
+
+    for i, patch_id in enumerate(patch_indices):
+        x, y, w, h = _compute_patch_coordinates(patch_id)
+        brightness = brightness_levels[i]
+        color = base_color * brightness  # 按亮度缩放黄色
+        overlay[y:y+h, x:x+w, :3] = color
+        overlay[y:y+h, x:x+w, 3] = alpha  # alpha固定控制透明度
+
+    # 叠加高亮层
+    ax.imshow(overlay)
+
+    return ax
+
+def visualize_multiple_patches(patches_dict, images_dict, patch_size = 14, figsize: tuple = (12, 10)):
+    num_layers = len(patches_dict)
+    sorted_layers = sorted(patches_dict.keys())
+    
+    n_rows = int(np.ceil(np.sqrt(num_layers)))
+    n_cols = int(np.ceil(num_layers / n_rows))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = axes.flatten()
+    
+    for i, layer_name in enumerate(sorted_layers):
+        title = f'Layer name: {layer_name}'
+        data = {
+            'image': images_dict[layer_name],
+            'selected_patches': patches_dict[layer_name],
+            'patch_size': patch_size
+        }
+        visualize_patches_on_image(data, axes[i], title, alpha=0.6)
+    
+    for j in range(num_layers, len(axes)):
+        axes[j].axis('off')
+
+    plt.tight_layout()
+    return fig

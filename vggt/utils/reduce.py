@@ -155,3 +155,88 @@ class TokenReducer:
             del self.proj
             self.proj = None
         torch.cuda.empty_cache()
+        
+        
+class PatchAttention:
+    def __init__(self, scale, topk_ratio=0.5, device=None, seed=42):
+        self.scale = scale
+        self.topk_ratio = topk_ratio
+        self.seed = seed
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(seed)
+        self.proj = None
+        
+    @torch.amp.autocast('cuda')
+    def attention(self, q, k, v, hierarchy_data):
+        B, H, N, D = q.shape
+        dtype = q.dtype
+        
+        S = hierarchy_data["num_frames"]
+        P = N // S
+        
+        clusters = hierarchy_data["clusters"]
+        K = len(clusters)
+        
+        keyframes = hierarchy_data["keyframes"]
+        
+        # reshape to (B, H, S, P, D)
+        q = q.view(B, H, S, P, D)
+        k = k.view(B, H, S, P, D)
+        v = v.view(B, H, S, P, D)
+
+        # prototypes from keyframes: (B, H, K, P, D)
+        q_proto = q[:, :, keyframes]   # keyframes length == K
+        k_proto = k[:, :, keyframes]
+        
+        topk_patch = max(1, int(P * self.topk_ratio))
+        attn_score = torch.max(torch.sum(k_proto * q_proto, dim=-1), dim=1)[0].mean(0)
+        _, patch_indices = torch.topk(attn_score, k=topk_patch, dim=-1) # (K, topk_patch)
+        del attn_score
+        
+        patch_idx_exp = patch_indices[None, None, :, :, None].expand(B, H, -1, -1, D)  # (B,H,K,top_k_patch,D)
+        q_sel = torch.gather(q_proto, index=patch_idx_exp, dim=3)
+        k_sel = torch.gather(k_proto, index=patch_idx_exp, dim=3).view(B, H, -1, D)
+        
+        out_frames = torch.zeros(B, H, S, P, D, device=self.device, dtype=dtype)
+        
+        for ci, frame_ids in enumerate(clusters):
+            Lq = len(frame_ids)
+            attn_score = torch.matmul(q_proto[:, :, ci], k_sel.transpose(-2, -1)) # (B, H, P, K * topk_patch)
+            attn_score = torch.amax(attn_score, dim=(0, 1, 2)) # (K * topk_patch)
+            
+            topk_pair = max(1, int(0.5 * K * topk_patch))
+            _, pair_indices = torch.topk(attn_score, k=topk_pair, dim=-1) # (topk_pair)
+            Ki = pair_indices // topk_patch
+            Kj = pair_indices % topk_patch
+            q_local = q[:, :, frame_ids].view(B, H, Lq * P, D)
+            
+            k_local, v_local, attn_mask = [], [], []
+            for cn in range(K):
+                Ln = len(clusters[cn])
+                k_parts = k[:, :, clusters[cn]][:, :, :, patch_indices[cn]].reshape(B, H, Ln*topk_patch, D)
+                v_parts = v[:, :, clusters[cn]][:, :, :, patch_indices[cn]].reshape(B, H, Ln*topk_patch, D)
+                
+                mask_parts = torch.zeros(Ln, topk_patch, dtype=torch.bool, device=self.device)
+                select = (Ki == cn)
+                if select.sum() == 0:
+                    continue
+                mask_parts[:, Kj[select]] = True
+            
+                k_local.append(k_parts)
+                v_local.append(v_parts)
+                attn_mask.append(mask_parts)
+                
+            k_local = torch.cat(k_local, dim=2)   # (B, H, Lk, D)
+            v_local = torch.cat(v_local, dim=2) 
+            
+            attn_mask = torch.cat(attn_mask, dim=0) # (S, topk_patch)
+            attn_mask = attn_mask.unsqueeze(0).expand(B*Lq*P, -1, topk_patch).view(B, q_local.shape[2], k_local.shape[2])
+            
+            out_local = F.scaled_dot_product_attention(q_local, k_local, v_local, 
+                                                       attn_mask=attn_mask,
+                                                       dropout_p=0.0)
+            out_frames[:, :, frame_ids, :, :] += out_local.view(B, H, len(frame_ids), P, D)
+
+            del q_local, k_local, v_local, out_local, k_parts, v_parts, attn_mask
+        
+        return out_frames.view(B, H, N, D)

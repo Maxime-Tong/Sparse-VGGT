@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
+def get_memory_info():
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+    return f"Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Max: {max_allocated:.2f}GB"
+
 
 class Aggregator(nn.Module):
     """
@@ -226,6 +232,7 @@ class Aggregator(nn.Module):
             "num_frames": num_frames,
             "num_clusters": n_clusters,
             "clusters": clusters,
+            "ref_cluster": labels[0],
             "keyframes": torch.tensor(keyframes, dtype=torch.long, device=device)
         }
         return result
@@ -251,8 +258,11 @@ class Aggregator(nn.Module):
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
+        print("Before patch_embed:", get_memory_info())
         patch_tokens = self.patch_embed(images)
-        
+        # torch.cuda.empty_cache()
+        print("After patch_embed:", get_memory_info())
+
         # Save patch_tokens
         # torch.save(patch_tokens, 'output/tmp/patch_tokens.pt')
 
@@ -290,6 +300,8 @@ class Aggregator(nn.Module):
 
         for layer_id in range(self.aa_block_num):
             for attn_type in self.aa_order:
+                # print()
+                # print(f"Before Layer {layer_id} {attn_type} attention:", get_memory_info())
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
@@ -300,6 +312,8 @@ class Aggregator(nn.Module):
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
+                # print(f"After Layer {layer_id} {attn_type} attention:", get_memory_info())
+                # print()
 
             intermediates_frames = [4, 11, 17, 23]
             if 'L' not in self.mode or layer_id in intermediates_frames:
@@ -307,10 +321,10 @@ class Aggregator(nn.Module):
                     # concat frame and global intermediates, [B x S x P x 2C]
                     concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                     output_list.append(concat_inter)
-
-        del concat_inter
-        del frame_intermediates
-        del global_intermediates
+                    del concat_inter
+                    
+            del frame_intermediates
+            del global_intermediates
         return output_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
@@ -332,6 +346,10 @@ class Aggregator(nn.Module):
                 tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+                
+            if 'T' in self.mode:
+                tokens = tokens.type(torch.bfloat16)
+                
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
@@ -355,6 +373,10 @@ class Aggregator(nn.Module):
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, hierarchy_data=hierarchy_data)
+            
+            if 'T' in self.mode:
+                tokens = tokens.type(torch.bfloat16)    
+            
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

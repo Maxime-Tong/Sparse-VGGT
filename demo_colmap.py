@@ -111,19 +111,22 @@ def run_VGGT(model, images, dtype, resolution=518):
     assert images.shape[1] == 3
 
     # hard-coded to use 518 for VGGT
-    images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
+    if isinstance(resolution, tuple):
+        images = F.interpolate(images, size=resolution, mode="bilinear", align_corners=False)
+    else:  
+        images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             images = images[None]  # add batch dimension
             aggregated_tokens_list, ps_idx = model.aggregator(images)
 
-        # Predict Cameras
-        pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-        # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-        # Predict Depth Maps
-        depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+            # Predict Cameras
+            pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+            # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+            # Predict Depth Maps
+            depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
 
     extrinsic = extrinsic.squeeze(0).cpu().numpy()
     intrinsic = intrinsic.squeeze(0).cpu().numpy()
@@ -164,12 +167,13 @@ def demo_fn(args):
     config = load_config(args.config)
     dataset = load_dataset(config, '', config)
     image_dir = os.path.dirname(dataset.color_paths[0])
-    image_path_list = dataset.color_paths[:200:10]
+    image_path_list = dataset.color_paths[:400]
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
     # Load images and original coordinates
     # Load Image in 1024, while running VGGT with 518
-    vggt_fixed_resolution = 518
+    # vggt_fixed_resolution = 518
+    vggt_fixed_resolution = (518, 518)
     img_load_resolution = 1024
 
     images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
@@ -241,11 +245,12 @@ def demo_fn(args):
         shared_camera = False  # in the feedforward manner, we do not support shared camera
         camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
 
-        image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
+        # image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
+        image_size = vggt_fixed_resolution
         num_frames, height, width, _ = points_3d.shape
 
         points_rgb = F.interpolate(
-            images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
+            images, size=image_size, mode="bilinear", align_corners=False
         )
         points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
         points_rgb = points_rgb.transpose(0, 2, 3, 1)
@@ -291,6 +296,9 @@ def demo_fn(args):
 
     # Save point cloud for fast visualization
     trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.output_dir, "sparse/points.ply"))
+    
+    with open(os.path.join(args.output_dir, "sparse/depths.bin"), 'wb') as f:
+        f.write(depth_map.tobytes())
 
     return True
 
@@ -312,7 +320,13 @@ def rename_colmap_recons_and_rescale_camera(
             pred_params = copy.deepcopy(pycamera.params)
 
             real_image_size = original_coords[pyimageid - 1, -2:]
-            resize_ratio = max(real_image_size) / img_size
+            
+            if isinstance(img_size, (tuple, list)):
+                original_max_size = max(img_size)
+            else:
+                original_max_size = img_size
+                
+            resize_ratio = max(real_image_size) / original_max_size
             pred_params = pred_params * resize_ratio
             real_pp = real_image_size / 2
             pred_params[-2:] = real_pp  # center of the image
