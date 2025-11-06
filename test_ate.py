@@ -122,7 +122,6 @@ def depth_l1_loss(pred_depths, gt_depths):
 args = parse_args()
 config = load_config(args.config)
 dataset = load_dataset(args, '', config)
-
 timestamps, est_poses = read_colmap_poses(args.output + '/sparse')
 N_images = len(timestamps)
 est_depths = read_depth_bin(args.output + '/sparse/depths.bin', (N_images, 518, 518))

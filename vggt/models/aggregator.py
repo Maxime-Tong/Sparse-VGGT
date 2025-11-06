@@ -206,9 +206,9 @@ class Aggregator(nn.Module):
         X = tokens.reshape(num_frames, -1).cpu().numpy()  # [N, P*C]
 
         # ---- Optional PCA reduction ----
-        if X.shape[0] > pca_dim:
-            pca = PCA(n_components=pca_dim, random_state=42)
-            X = pca.fit_transform(X)
+        pca_dim = min(pca_dim, X.shape[0])
+        pca = PCA(n_components=pca_dim, random_state=42)
+        X = pca.fit_transform(X)
         import time
         start_time = time.time()
         
@@ -258,10 +258,10 @@ class Aggregator(nn.Module):
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
-        print("Before patch_embed:", get_memory_info())
+        # print("Before patch_embed:", get_memory_info())
         patch_tokens = self.patch_embed(images)
         # torch.cuda.empty_cache()
-        print("After patch_embed:", get_memory_info())
+        # print("After patch_embed:", get_memory_info())
 
         # Save patch_tokens
         # torch.save(patch_tokens, 'output/tmp/patch_tokens.pt')

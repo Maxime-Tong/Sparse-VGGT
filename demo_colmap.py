@@ -159,7 +159,7 @@ def demo_fn(args):
     _URL = "weights/model.pt"
     model.load_state_dict(torch.load(_URL))
     model.eval()
-    model = model.to(device)
+    model = model.to(dtype).to(device)
     print(f"Model loaded")
 
     # Get image paths and preprocess them

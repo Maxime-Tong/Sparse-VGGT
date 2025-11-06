@@ -16,10 +16,10 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
 
-from typing import Dict
+from typing import Dict, Tuple
 
 from flash_attn import flash_attn_func
-from vggt.utils.reduce import TokenReducer, PatchAttention
+from vggt.utils.cluster import ClusterAttention
 
 XFORMERS_AVAILABLE = False
 
@@ -29,7 +29,7 @@ def get_memory_info():
     max_allocated = torch.cuda.max_memory_allocated() / 1024**3
     return f"Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Max: {max_allocated:.2f}GB"
 
-def adaptive_sparsity(layer_idx, total_layers=24, min_sparsity=0.3, max_sparsity=0.7):
+def adaptive_sparsity(layer_idx, total_layers=24, min_sparsity=0.2, max_sparsity=0.5):
     import numpy as np
     x = layer_idx * np.pi / (total_layers - 1)
     weight = (1 - np.cos(x)) / 2
@@ -69,8 +69,7 @@ class Attention(nn.Module):
         self.layer = layer
         
         self.mode = mode
-        # self.reducer = TokenReducer(scale=self.scale, n_hashes=3, n_buckets=32)
-        self.reducer = PatchAttention(scale=self.scale)
+        self.cluster_attentin = ClusterAttention(salient_ratio=adaptive_sparsity(self.layer))
 
     @torch.amp.autocast('cuda')
     def _hierarchy_dot_product(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hierarchy_data: Dict) -> torch.Tensor:
@@ -105,13 +104,33 @@ class Attention(nn.Module):
         _, patch_indices = torch.topk(attn_score, k=top_k_patch, dim=-1)  # (K, top_k_patch)
         del attn_score
         
+        # if self.layer <= 10:
+        #     cluster_indices = [list(range(K))] * K
+        # else:
+        q_proto = q_proto.view(B, H, K, P * D)
+        k_proto = k_proto.view(B, H, K, P * D)
+        attn_score = torch.amax(torch.matmul(q_proto * self.scale, k_proto.transpose(-2, -1)).softmax(-1), dim=(0, 1))
+        
+        sorted_scores, sorted_indices = torch.sort(attn_score, dim=1, descending=True)
+        cumulative_ratios = torch.cumsum(sorted_scores, dim=1) / attn_score.sum(dim=1, keepdim=True)
+        
+        threshold_mask = cumulative_ratios >= 0.9
+        num_selected = torch.argmax(threshold_mask.int(), dim=1) + 1
+        
+        no_selection_mask = (num_selected == 1) & ~threshold_mask[:, 0]
+        num_selected[no_selection_mask] = K
+        
+        cluster_indices = [sorted_indices[i, :n].tolist() for i, n in enumerate(num_selected)]
+        del q_proto, k_proto, attn_score, threshold_mask
+        torch.cuda.empty_cache()
+        
         # calculate sparse attention by cluster
         out_frames = torch.zeros(B, H, S, P, D, device=device, dtype=dtype)
         
         for ci, frame_ids in enumerate(clusters):
             Lq = len(frame_ids) * P
             q_local = q[:, :, frame_ids, :, :].reshape(B, H, Lq, D)
-
+            
             k_parts = []
             v_parts = []
             for nc in range(K):
@@ -119,10 +138,11 @@ class Attention(nn.Module):
                 if len(frames_nc) == 0: 
                     continue
                 
+                sampled_frames_nc = frames_nc
                 if nc in [hierarchy_data['ref_cluster'], ci]:
                     sampled_frames_nc = frames_nc
-                else:
-                    frame_subsample_ratio = 0.7
+                elif nc not in cluster_indices[ci]:
+                    frame_subsample_ratio = 0.6
                     num_frames_to_sample = max(1, int(len(frames_nc) * frame_subsample_ratio))
                     frame_indices = torch.randperm(len(frames_nc), device=device)[:num_frames_to_sample]
                     sampled_frames_nc = frames_nc[frame_indices]
@@ -153,7 +173,7 @@ class Attention(nn.Module):
         del q_local, k_local, v_local, out_local, k_parts, v_parts
         torch.cuda.empty_cache()
         return out_frames.view(B, H, N, D)
-
+        
     def forward(self, x: Tensor, pos=None, hierarchy_data: Dict = None) -> Tensor:
         B, N, C = x.shape
         # Compute QKV and split (keep as minimal temp tensors)
@@ -168,21 +188,16 @@ class Attention(nn.Module):
             k = self.rope(k, pos)
             
         if hierarchy_data is not None and 'P' in self.mode:
-            # x = self.reducer.cluster_attention(q, k, v, hierarchy_data)
-            print("Before execute hierarchy attention", get_memory_info())
-            x = self._hierarchy_dot_product(q, k, v, hierarchy_data)
-            print("After execute hierarchy attention", get_memory_info())
+            # print("Before execute hierarchy attention", get_memory_info())
+            # x = self._hierarchy_dot_product(q, k, v, hierarchy_data)
+            x = self.cluster_attentin.attention(q, k, v, hierarchy_data)
+            self.cluster_attentin.cleanup()
+            # print("After execute hierarchy attention", get_memory_info())
         elif self.fused_attn:
-            if hierarchy_data is not None:
-                print("Before scaled_dot_product_attention", get_memory_info())
-                
             x = F.scaled_dot_product_attention(
                 q, k, v, 
                 dropout_p=self.attn_drop.p if self.training else 0.0
             )     
-            
-            if hierarchy_data is not None:
-                print("After scaled_dot_product_attention", get_memory_info())
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
